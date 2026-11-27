@@ -749,7 +749,11 @@ pub(crate) struct Digest(pub(crate) u128);
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
 pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
-    let first = if crate::resource::held_only() { first } else { 0 };
+    let first = if crate::resource::held_only() && crate::resource::host_tiled(resource).is_none() {
+        first
+    } else {
+        0
+    };
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1909,14 +1913,12 @@ fn committed_by_query(at: *const u8, len: usize) -> bool {
     true
 }
 
-/// How many bytes of `[at, at + len)` are committed memory: all of a
-/// texture that is there, some of one streaming in (its smaller mips lie
-/// at the start of its memory, and their pages are mapped first), none of
-/// one not there. With neither the first nor the last page committed the
-/// answer is none without a look at the pages between (two queries for the
-/// slots whose texture is away, which are asked again and again).
+/// How many bytes of a streamed texture are available for upload.
+/// The first resident mip can lie in the middle of the address range.
 pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
-    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
     if len == 0 {
         return 0;
     }
@@ -1932,10 +1934,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     {
         return there;
     }
-    if !committed(at, 1) && !committed((end - 1) as *const u8, 1) {
-        return 0;
-    }
-    if !by_query() {
+    if !by_query() && committed(at, 1) {
         static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
             // By page, without the walk: whole pages, cut to the range.
@@ -1952,6 +1951,8 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         return mapped_texture_blocks(start, end);
     }
+    // A leading hole can end within a console block. Follow the host's
+    // region boundaries to count any readable interior pages.
     let (mut p, mut there) = (start, 0u64);
     while p < end {
         // SAFETY: plain data filled in by the query.
@@ -1962,7 +1963,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         if n == 0 || next <= p {
             break;
         }
-        if info.State == MEM_COMMIT {
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 {
             there += (next - p) as u64;
         }
         p = next;
@@ -2001,9 +2002,11 @@ fn mapped_texture_blocks(start: usize, end: usize) -> u64 {
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> Option<Arc<Staging>> {
     let texture = &copy.texture;
-    // Asked before the table is locked: the sweep lets go of a staging
-    // buffer with its texture's host side locked, in that order.
-    let on_demand = crate::resource::host_tiled(resource).is_some();
+    // Tiled (`on_demand`) textures must stage every mip from level 0 so
+    // `record_upload` writes any newly mapped level; non-tiled textures keep
+    // per-view `first` trimming when `held_only()` is active.
+    let on_demand = copy.tiled.is_some();
+    let first = if on_demand { 0 } else { first };
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     let map = map.get_or_insert_with(HashMap::new);
     if let Some(s) = map.get(&(resource as usize))
@@ -2114,6 +2117,27 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 #[cfg(test)]
 mod title_memory_tests {
     use super::with_title;
+
+    #[test]
+    fn texture_residency_finds_readable_pages_between_unmapped_ends() {
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 4096;
+        // SAFETY: all addresses belong to this test's private reservation.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 8 * PAGE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(2 * PAGE).cast();
+            assert_eq!(VirtualAlloc(middle, 2 * PAGE, MEM_COMMIT, PAGE_READWRITE), middle);
+            let blocked = base.add(5 * PAGE).cast();
+            assert_eq!(VirtualAlloc(blocked, PAGE, MEM_COMMIT, PAGE_NOACCESS), blocked);
+
+            let resident = super::mapped_bytes(base.add(19), 7 * PAGE);
+            let empty = super::mapped_bytes(base, 2 * PAGE);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            assert_eq!(resident, (2 * PAGE) as u64);
+            assert_eq!(empty, 0);
+        }
+    }
 
     #[test]
     fn a_zero_sparse_read_keeps_the_digest_of_the_staged_texels() {
