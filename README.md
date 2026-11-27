@@ -1,241 +1,212 @@
-# Vice-Tay
+# ViceTux
 
-Vice-Tay runs an Xbox Series title natively on Windows, from files you supply,
-through [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer:
-it loads the console executable, answers its system calls and translates its
-GPU work to Direct3D 12. This tree is tuned and fixed on one PC, an RTX 4090
-with a Ryzen 9 9950X3D and 48 GB of RAM, toward one goal: the open world at
-30 frames a second, with the picture right, fully playable.
+**Vice-Tay, made to run on Linux.** ViceTux runs the Xbox Series build of the
+title on a Linux PC under Proton, through the
+[VIctory](https://github.com/Marvisak/VIctory) compatibility layer: it loads
+the console executable, answers its system calls and translates its GPU work
+to Direct3D 12, which Proton's vkd3d-proton turns into Vulkan.
 
-**No game files, code or assets are in this repository.** You need your own
-copy of the game. Vice-Tay is not affiliated with or endorsed by the game's
-developer or publisher.
+It is [TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay) (tuned for
+Windows on an RTX 4090) with the fixes it takes to run under Wine and
+vkd3d-proton, a launcher for Linux, and settings for a mid-range NVIDIA card.
 
-> [!TIP]
-> **[View the gameplay screenshots](https://github.com/TaynanGT/Vice-Tay-Screenshots#readme)**
->
-> Ten captures from an earlier Series S playtest, on build `672cf831`.
+> [!IMPORTANT]
+> **No game files, code or assets are in this repository.** You need your own
+> dump of the Xbox Series build. ViceTux is not affiliated with or endorsed by
+> the game's developer or publisher.
 
-## At a glance
+## Where it stands
 
-- **It plays.** On the Series S profile the prologue runs from the prison
-  through the boat section to an island, driven by hand, with failed attempts
-  picked up again from checkpoints ([Gameplay](#gameplay)).
-- **It is not fast enough yet.** 21.1 fps at the median over the latest
-  30-minute session, short of the 30 fps goal ([Tests](#tests)).
-- **Every change is tested twice:** by CI, and by playing it on this PC with
-  the frame rate, memory and card measured from the game's own frame lines.
+Measured on the PC it is tuned on:
 
-## Gameplay
+| | |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4060, 8 GB (driver 620.73) |
+| CPU | AMD Ryzen 7 7700X, 8 cores / 16 threads |
+| RAM | 30 GiB, 4 GiB zram swap |
+| Storage | the hot archives on an NVMe SSD, the rest on a hard disk |
+| Software | Linux (zen kernel), Proton Experimental 11.0, a patched wineserver |
 
-What a session plays, on the Series S profile, as in the latest 30-minute
-session (minutes in the world):
+| What | Result |
+|---|---|
+| Menus, videos | 30 fps (the title's own cap) |
+| The prison, the heavy rooms (3,000-5,000 draws) | **15-16 fps** median |
+| Lighter scenes | 19-24 fps |
+| With ray tracing on | 7-8 fps: the right light, not playable on this card |
+| Loading to the world | about 2 minutes; the first run longer (shaders, pipelines) |
 
-1. **Loading.** The start screen after 72 s, the world after 120 s.
-2. **The prison and the ride out** (0-4 min). Cutscenes carry the story from
-   the prison to a boat on open water.
-3. **The boat, by hand** (4-25 min). Following a plane to the package it drops,
-   with Focus to find it, then the route the map draws: under a road bridge and
-   an iron bridge, along a mangrove channel, past a broken pier and across a bay
-   to an island with a crashed plane.
-4. **Failing and trying again.** Running aground ends the mission ("the boat is
-   no longer usable"). The game offers to repeat the checkpoint, skip it or
-   restart the mission; repeating and skipping both work, and the run goes on.
-5. **On foot** (25-30 min). Off the boat on the island's beach, with the
-   inventory tutorial; the pause menu opens and closes.
+It plays, but it is not smooth yet. See [Known problems](#known-problems).
 
-The HUD, minimap, route, mission prompts and subtitles work throughout. Since
-[#57](https://github.com/TaynanGT/Vice-Tay/pull/57) a performance panel sits in the top-left corner of every session: FPS and
-frame times with a graph, resolution, draws, GPU and CPU with their load, VRAM
-and RAM. **F3** hides it, `-NoPanel` starts without it. Every session is
-recorded to video on the card's encoder.
+## What ViceTux fixes for Linux
 
-### Series S gameplay clip
+Each of these was found and measured in a session on the PC above.
 
-The boat section on the RTX 4090 test PC, with the performance panel visible.
+| Problem under Proton | Fix |
+|---|---|
+| **The HUD, menus and subtitles were missing.** Wine's shader compiler refuses the `[RootSignature]` attribute, so the plane the interface is drawn on was never composed over the scene. | The composer's root signature is built in code ([`compose.rs`](crates/victory-gpu/src/compose.rs)). |
+| **About 3,500 draws a frame were dropped** (missing geometry). Wine's compiler refuses `RWByteAddressBuffer.InterlockedOr` in the indirect-argument clamp. | The launcher installs Microsoft's `d3dcompiler_47` into its own prefix and forces it. |
+| **2-4 fps forever, about 1,000 pipelines "being made".** vkd3d-proton's DXIL-to-SPIR-V translator recursed without end on seven compute programs (loops with two back edges); the pipeline workers died and their queue never drained. | Every loop gets a single latch before the DXIL is written (from [kroeeee-eeee's Linux fork](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX)); a watchdog replaces a dead worker and leaves its pipeline out from then on (`lost-pipelines.txt` in the cache). Six of the seven now build. |
+| **Water volumetrics never drawn** on 32-lane cards. `VICTORY_WAVE_WIDE_ONLY` had turned nothing on since upstream made it a filter of `VICTORY_WAVE_WIDE=1`. | The list alone turns the wave-wide form on for the programs it names (this fixes upstream's `play.ps1` on Windows too). |
+| **Brown and dark blotches in lit haze.** The ray-traced shadow passes ran with no acceleration structure built. | Left out under Wine unless ray tracing is on (`VICTORY_RT_SHADOWS`). |
+| **Rooms went black** when their lamps left the screen (the bounced-light stand-in only sees what is on screen). | A floor under the estimate (`VICTORY_AMBIENT_FLOOR`), a 4 s mean instead of 250 ms, and a bound on the haze. |
+| **25-90 ms a frame in the write watch.** The stock wineserver walks all of the title's tens of thousands of mapped views on every map and unmap. | A wineserver with a view tree ([`linux/wineserver`](linux/wineserver)): 11.1 → 15.8 fps median. |
+| **75,000-216,000 `VirtualQuery` a second** under Wine's process-wide lock. | Uncommitted regions are remembered ([`watch.rs`](crates/victory-gpu/src/watch.rs), from kroeeee-eeee's fork). |
+| **Textures waited a mean 23 s** for their data with the dump on a hard disk. | [`scripts/fast-copy.sh`](scripts/fast-copy.sh) puts the archives the title streams most on an SSD: 3 s. |
 
-https://github.com/user-attachments/assets/bd07891c-c53f-4f46-9b7e-80463c379b84
-
-## Tests
-
-Every change goes through the same two steps before it is merged:
-
-1. **CI.** Clippy with and without the diagnostics feature, every test in both
-   configurations, and the repository policy check (`cargo xtask`), locally and
-   on GitHub.
-2. **A session in the game.** The Series S profile in full screen, played by
-   hand or by a scripted route (walk, run, turn the camera, a capture every
-   minute). Nothing compiles meanwhile. A change that could cost frames is run
-   against a control of the same base, the same route and the same length.
-
-### Latest sessions
-
-Newest first. fps from the game's once-a-second frame lines in the world (over
-1,000 draws a frame); memory is the game's private bytes, sampled every 20 s.
-
-| Session | Build | Played | In the world | fps: median (p10-p90; 1% low) | Game memory, median / max | What it showed |
-|---|---|---|---|---|---|---|
-| Performance panel | `5963f415` ([#57](https://github.com/TaynanGT/Vice-Tay/pull/57)) | scripted route | 5 min | 20.8 (16.8-23.9; 1.4) | 26.2 / 27.1 GB | The panel on screen at no cost in frame rate; GPU load read from Windows (87% in the boat scene) |
-| The boat section | `bc090416` | by hand | 30 min | 21.1 (19.1-23.2; 17.0) | 23.5 / 24.1 GB | The prologue through the boat section; frame rate eased from 21.7 to 20.6 fps and memory grew by about 1 GB from the first ten minutes to the last |
-
-Each session's timeline, the frame broken into its parts and the card's
-readings: [docs/tests.md](docs/tests.md) and
-[docs/measurements.md](docs/measurements.md). What earlier sessions found and
-fixed: [docs/findings-rtx4090.md](docs/findings-rtx4090.md).
-
-### Under test, not merged yet
-
-| Change | From | Status |
-|---|---|---|
-| Title textures uploaded at the start of each submission (frame order, flickering) | [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) `5d6bd841` | CI green; Series S session against a control |
-| Wave64 groups over 64 threads keep exact barriers through divergence (translator version 3) | the C01 translator batch | Reviewed; Series S session against a control |
-| PC FSR 4.1.2 to 3840×2160 (`-Fsr4K`, Series X profile) | Belobug, from [DexNom/VIctory](https://github.com/DexNom/VIctory) `ab34a8b2` | Ported; needs AMD's signed upscaler DLL |
-| DLSS 4.5 Super Resolution (`-Dlss4K`) on the same bridge | this tree | Being written |
-
-### Test reliability
-
-Four `victory-gpu` tests failed CI now and then. Three shared global state with
-tests running beside them (the one asking of `watch::ask_once`, the heap-sync
-thread) and were fixed in [#55](https://github.com/TaynanGT/Vice-Tay/pull/55);
-the fourth assumed where a heap would land and was fixed with the panel. Over
-the whole `victory-gpu` suite run 15 times per commit: 3 failures before, none
-in 30 runs after.
-
-## Test PC
-
-| Component | Configuration |
-| --- | --- |
-| CPU | AMD Ryzen 9 9950X3D, 16 cores and 32 threads |
-| Motherboard | MSI MAG X870 TOMAHAWK WIFI (MS-7E51), revision 1.0 |
-| BIOS | MSI 1.A93 |
-| GPU | NVIDIA GeForce RTX 4090, 24 GB GDDR6X |
-| NVIDIA driver | 621.40 |
-| Integrated graphics | AMD Radeon Graphics |
-| RAM | 48 GiB DDR5 (2 × 24 GiB), configured at 8,000 MT/s; 43.4 GiB visible to Windows |
-| Page file | 128 GiB |
-| System SSD | Samsung 990 PRO 4 TB NVMe |
-| Additional SSDs | Samsung 990 PRO 2 TB NVMe and Samsung 970 PRO 1 TB NVMe |
-| Monitor | Samsung Odyssey OLED G8 (G81SF), 3840 × 2160, 240 Hz |
-| OS | Windows 11 Pro 26H2 x64, build 26300.10075 |
-
-## Known problems
-
-- **Frame rate.** Below 30 fps in the world. Of a 47 ms frame, about 34 ms go to
-  preparing the GPU's work on the CPU and 13 ms to copying data back.
-- **Memory.** The game holds 23-27 GB on the Series S profile. On a PC with less
-  free RAM than that, Windows pages part of it out and frames stall.
-- **Picture.** Skin, hair and some walls show flat bands of colour; some objects
-  (tanks, tarps, plants, a skylight) glow in flat purple, pink or blue; some faces
-  show scrambled colour patches and some eyes are lit white; clouds and reflections
-  break into square blocks; a few shapes render as flat black.
-  For banding that varies between launches, pass `-More @{VICTORY_RTV_FORMAT_LOG='1'}`
-  to `scripts\play.ps1` on a diagnostics build. Compare the `RTV format check`
-  totals and `RTV format mismatch` examples at the same checkpoint in a clean and a banded run.
-- **Ray tracing.** The ray-traced structures are not built by default, so a few
-  hundred dispatches a frame are skipped and some light is missing; `-RayTracing`
-  builds them.
-- **Loading.** The first run of a new build translates every shader while it plays;
-  translate them ahead (below).
-- **Measuring.** On the Series S profile the log's GPU-time counter reads near
-  zero, so the tables leave it out; the panel's GPU load comes from Windows instead.
+The commits say more about each: `git log upstream/main..`.
 
 ## Getting started
 
-You need Windows 10 or 11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned in the repository),
-the MSVC build tools with a Windows SDK, and your own dump of the title.
+### What you need
 
-```powershell
-git clone https://github.com/TaynanGT/Vice-Tay
-cd Vice-Tay
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
+- Linux with Steam and **Proton - Experimental** installed (Library → Tools).
+- A GPU with Vulkan 1.3 and mesh shaders: tested on NVIDIA (proprietary
+  driver); AMD on Mesa should work (kroeeee-eeee's fork runs there).
+- **RAM: 32 GB with 8 GB or more of swap.** The title holds 23-27 GB.
+- **An SSD** for at least the hot archives (about 110 GB).
+- Rust (the toolchain is pinned), [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin),
+  `clang`/`lld`, `winetricks`, and for the wineserver `gcc`, `make`, `flex`,
+  `bison`, `autoconf`, `perl`.
+- Your own dump of the title.
+
+### 1. Build
+
+```sh
+git clone https://github.com/ErRusso/ViceTux
+cd ViceTux
+cargo install cargo-xwin
+cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 ```
 
-From the repository root, translate the shaders and warm the pipelines (each can
-be stopped and resumed). With `game_dir` set in `victory.toml`, the shader
-command scans that directory. To scan one archive, pass its quoted path, for
-example `.\target\diag\victory.exe shaders "D:\My Game Dump\shaders.rpf"`.
+The first build downloads the Windows SDK headers and libraries (accept the
+licence prompt).
 
-```powershell
-.\target\diag\victory.exe shaders       # scans game_dir in victory.toml
-.\target\diag\victory.exe warm --used   # pipelines earlier runs drew with
+### 2. Put the game where it streams fast
+
+If your dump is on a hard disk, copy the archives the title streams most to an
+SSD and link the rest:
+
+```sh
+scripts/fast-copy.sh /path/to/your/dump ~/Games/ViceTux-game
+echo ~/Games/ViceTux-game > ~/.local/share/vice-tay/game-dir
 ```
 
-Then play on the Series S profile, the one every session above uses:
+On btrfs the folder becomes a subvolume of its own, so snapshots of your home
+(snapper, timeshift) do not pin 100 GB of game data. If the whole dump is on
+an SSD already, just put its path in `~/.local/share/vice-tay/game-dir` (or
+set `VICTORY_GAME_DIR`).
 
-```powershell
-scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
+### 3. Build the faster wineserver (recommended)
+
+```sh
+linux/wineserver/build.sh
 ```
 
-`Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click
-PowerShell asks for the executable's path.
+It fetches the Wine source of your installed Proton Experimental build,
+applies the view-tree patch, builds only the server (about a minute) and makes
+a 7 MB Proton of links next to it. Your Steam Proton is not touched. Run it
+again when Proton Experimental updates; until then the launcher says so and
+uses the stock server.
+
+### 4. Translate the shaders (once per build of the translator)
+
+```sh
+scripts/play-linux.sh --cmd shaders
+```
+
+### 5. Play
+
+```sh
+scripts/play-linux.sh --windowed
+```
+
+The first start installs `d3dcompiler_47` into its own Proton prefix
+(`~/.local/share/vice-tay/prefix`). The first minutes in the world stutter
+while pipelines are made; they are kept for the next runs.
 
 | Option | What it does |
 |---|---|
-| (none) | Full screen, Series X profile, settings picked for your graphics card, performance panel on |
-| **F11** or **Alt+Enter** | Switch between full screen and a window while it runs |
-| **F3** | Hide or show the performance panel |
-| `-NoPanel` | Start without the performance panel |
-| `-Windowed` | Start in a window |
-| `-Console series-s` | Run as a Series S: a smaller picture, lighter on the card, faster; the profile every session uses |
-| `-Machine 4090` / `7900xtx` | Force the settings for NVIDIA (measured on the RTX 4090) or AMD |
-| `-Safe` | Leave out the changes still on trial; try it first when something goes wrong |
-| `-RayTracing` | Build the ray-traced structures, so the title's ray-traced indirect light runs |
-| `-Build release` | Run `target\release\victory.exe` (`cargo build --release --locked -p victory`); it has no panel |
+| (none) | Full screen, Series S profile, settings for your card, performance panel on |
+| `--windowed` | In a window |
+| `--no-panel` | Without the performance panel (**F3** hides it while playing) |
+| `--raytracing` | The title's own ray-traced light: correct indoor lighting, about half the frame rate |
+| `--rt-shadows` | With `--raytracing`: the ray-traced shadows too (slower still) |
+| `--machine 4060\|4070\|4090\|7900xtx` | Force a profile (default: picked from your card) |
+| `--console series-x` | Run as a Series X (heavier) |
+| `--safe` | Leave out the settings still on trial |
+| `--breadcrumbs` | vkd3d-proton's breadcrumbs and log, for chasing a GPU fault |
+| `--cmd shaders\|warm` | Translate shaders / make pipelines ahead |
+| `VICTORY_...=value` | Any layer switch, after the options |
 
-Every `VICTORY_...` switch is described in a comment where the code reads it.
-More commands and debugging switches:
-[docs/README-fxceless.md](docs/README-fxceless.md) and [docs/findings.md](docs/findings.md);
-recording one frame and running it again: [docs/replay.md](docs/replay.md).
+Environment: `VICTORY_GAME_DIR` (your dump), `VICTORY_HOME` (cache, saves,
+prefix, logs; default `~/.local/share/vice-tay`), `PROTON` (another Proton),
+`AMBIENT_FLOOR` (the bounced-light floor without rays, default `0.35`).
+
+Every run writes the layer's log to `~/.local/share/vice-tay/logs/`.
+
+## Known problems
+
+- **A crash at the prison cutscene `int_prolo…_int_min`.** The card faults
+  reading an unmapped address (NVIDIA `Xid 31`, an MMU fault in the constant
+  cache) and the title's own watchdog ends it 30 s later ("GPU Loc Sig").
+  Reproducible, same address every run; not found yet. Skipping the cutscene
+  may get past it.
+- **Frame rate.** 15-16 fps in heavy rooms: about 40 ms a frame preparing the
+  GPU's work on the CPU, 15-25 ms copying data back, and the 4060 near full.
+- **Lighting without ray tracing** is an estimate: rooms are lit, but flatter
+  than the title's own light. With `--raytracing` it is right, at 7-8 fps on
+  an RTX 4060 (the title traces its rays in compute shaders that the layer
+  translates; there is no hardware ray tracing to lean on).
+- **White patches on glossy floors and tables**: the ray-traced reflection
+  resolve is left out without ray tracing, and those surfaces show stale data.
+- **One compute program still kills vkd3d-proton's compiler**
+  (`InstanceCulling:CS_Prop_BatchNoCull`): left out, so some props can be
+  missing.
+- **VRAM.** An 8 GB card is full: about 7 GB for the title's process (the
+  panel counts only the layer's share), the rest for the desktop. Close the
+  browser while playing.
+- **The render resolution is fixed** at 1920×1080 output on the Series S
+  profile: the title's FSR4 build refuses others and crashes.
+
+## Troubleshooting
+
+| | |
+|---|---|
+| The HUD is missing, or the world is mostly empty | `d3dcompiler_47` is not the native one: delete `~/.local/share/vice-tay/prefix/.native-d3dcompiler` and start again |
+| "Proton Experimental was updated" at start | Run `linux/wineserver/build.sh` again |
+| Stuck at a few fps with pipelines "being made" | A translator change: run `scripts/play-linux.sh --cmd shaders` |
+| The game closes during a cutscene | `journalctl -k \| grep Xid`: a GPU fault (above) |
+| Textures and models arrive late | The dump is on a hard disk: `scripts/fast-copy.sh` |
+| Your disk fills up | Snapshots of your home holding deleted files; keep the game in its own subvolume |
 
 ## How this tree is built
 
-Vice-Tay is published as a repository of its own, not as a GitHub fork, with the
-whole history of the trees it comes from. It started from codec-d/cool_fox (now
-taken down), which is [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)
-with work for NVIDIA cards on top. New work from avatarmanz is merged as it lands,
-and changes from other forks and our own fixes come in through pull requests,
-each tested as described under [Tests](#tests) before it is merged. What each
-change does: [docs/this-fork.md](docs/this-fork.md). How the layer works:
+ViceTux carries the whole history of the trees it comes from. Upstream work
+from [TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay) is merged as
+it lands, and the Linux changes are commits on top. The upstream README, with
+its Windows instructions and measurements, is
+[docs/README-vice-tay.md](docs/README-vice-tay.md); how the layer works:
 [docs/architecture.md](docs/architecture.md).
 
 ## Credits
 
-This is other people's work with more on top. The history is kept, and commits
-taken from elsewhere name the original commit and its author. Everyone with a
-commit here is listed in [docs/credits.md](docs/credits.md).
+This is other people's work with Linux fixes on top:
 
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and the
-  people whose pull requests it carries.
-- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**:
-  list calls recorded on the title's threads and translated by workers,
-  submissions prepared on threads of their own, cheaper write guards, textures on
-  a copy queue, frame record and replay.
-- **codec-d/cool_fox** (taken down by its author): two-plane composition, fallback
-  heaps, table plans, the residency guard, fence wakes on `WaitOnAddress`, wave32
-  lowering for NVIDIA, movie-plane uploads and XMA audio fixes.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the performance panel, the ambient light idea, pipeline workers, and work by
-  romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- Pull requests to this repository by **meshahid973** (relocation checks),
-  **nullexxx** (file logging; an empty pipeline library on vkd3d-proton),
-  **cxy0072019-sketch** (saved pipeline scheduling left out on request) and
-  **welisonzika14-jpg** (placed-filler bookkeeping kept out of default builds).
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
+- **[TaynanGT/Vice-Tay](https://github.com/TaynanGT/Vice-Tay)** and everyone
+  it credits in [docs/credits.md](docs/credits.md) and
+  [docs/README-vice-tay.md](docs/README-vice-tay.md#credits).
+- **[kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX](https://github.com/kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX)**
+  (with datingesp-hash): the single-latch translation, remembered
+  uncommitted regions, and the wineserver view-tree patch.
+- [Proton](https://github.com/ValveSoftware/Proton),
+  [Wine](https://www.winehq.org/) and
+  [vkd3d-proton](https://github.com/HansKristian-Work/vkd3d-proton).
 
 ## License
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file it does not
-cover is named in [docs/asset-policy.md](docs/asset-policy.md).
+cover is named in [docs/asset-policy.md](docs/asset-policy.md). The wineserver
+patch in `linux/wineserver/` applies to Wine (LGPL-2.1-or-later).

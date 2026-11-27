@@ -8,7 +8,7 @@
 #                         [KEY=VALUE ...]   extra VICTORY_* overrides
 #
 # Paths come from the environment (defaults in brackets):
-#   VICTORY_GAME_DIR  [~/Games/GTA6-fast once levels.rpf is copied there, else the hard disk dump]
+#   VICTORY_GAME_DIR  [the first line of $VICTORY_HOME/game-dir]  your dump
 #   VICTORY_HOME      [~/.local/share/vice-tay]  cache, saves and the Proton prefix
 #   VICTORY_PREFIX    [$VICTORY_HOME/prefix]  the Proton prefix (one per Proton build)
 #   PROTON            [~/.steam/steam/steamapps/common/Proton - Experimental/proton]
@@ -17,15 +17,17 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 home_default="$HOME/.local/share/vice-tay"
 home="${VICTORY_HOME:-$home_default}"
-# ~/Games/GTA6-fast: the dump as links, with the archives the title streams
-# most (levels.rpf, the texture tiles of data/ttdb) copied to the NVMe drive:
-# from the hard disk, textures waited a mean 23 s for their data.
-fast="$HOME/Games/GTA6-fast"
-hdd=/mnt/8a9e43ef-9dc0-45b9-a0ef-62fbdeba405d/Games/ROMs/XBOX/GTA6.DUMP
-if [[ -z ${VICTORY_GAME_DIR:-} && -f "$fast/levels.rpf" && ! -L "$fast/levels.rpf" ]]; then
-    game_dir="$fast"
-else
-    game_dir="${VICTORY_GAME_DIR:-$hdd}"
+# Your dump: VICTORY_GAME_DIR, else the first line of $VICTORY_HOME/game-dir.
+# Keep it on an SSD: from a hard disk the title's streaming left textures
+# waiting a mean 23 s for their data (scripts/fast-copy.sh puts the
+# archives it streams most on fast storage and links the rest).
+game_dir="${VICTORY_GAME_DIR:-}"
+if [[ -z $game_dir && -f "$home/game-dir" ]]; then
+    game_dir="$(head -n1 "$home/game-dir")"
+fi
+if [[ -z $game_dir ]]; then
+    echo "Set VICTORY_GAME_DIR to your dump's folder, or put that path in $home/game-dir." >&2
+    exit 1
 fi
 # A Proton Experimental whose wineserver keeps mapped views in a tree
 # (kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX, linux/wineserver):
