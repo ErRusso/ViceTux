@@ -1298,6 +1298,9 @@ pub(crate) struct HostList {
     /// The number of the last submission that ran this list
     /// ([`submissions`]); a reset before it finished is reported.
     submitted_in: std::sync::atomic::AtomicU64,
+    /// The host fence's value signalled behind that submission: the card
+    /// has run it once the fence reaches it.
+    card_value: std::sync::atomic::AtomicU64,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Whether the underlying D3D12 list has been closed since its last reset.
@@ -4945,6 +4948,7 @@ impl Host {
             Ok(HostList {
                 allocator,
                 submitted_in: std::sync::atomic::AtomicU64::new(0),
+                card_value: std::sync::atomic::AtomicU64::new(0),
                 list: rec::Rec::new(list),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 deferred: Mutex::default(),
@@ -6645,6 +6649,9 @@ impl Host {
                 }
                 self.queue.Signal(&self.fence, *submitted)
             };
+            for list in runs {
+                list.card_value.store(*submitted, Ordering::Relaxed);
+            }
             awake::sent(&self.device);
             #[cfg(feature = "diagnostics")]
             crate::timeline::sent(sending, *submitted, stamp);
@@ -7266,15 +7273,32 @@ impl HostList {
         let last = self.submitted_in.load(Ordering::Relaxed);
         let finished = FINISHED.load(Ordering::Acquire);
         if last > finished {
-            static EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+            // The count lags the card where the relay lands flights (it
+            // signals the title's fences before it counts them finished):
+            // the card's own fence says whether the list's work is done.
+            let value = self.card_value.load(Ordering::Relaxed);
+            // SAFETY: a plain query of the host's fence.
+            let done = host().map_or(u64::MAX, |h| unsafe { h.fence.GetCompletedValue() });
+            static EARLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+            let running = value > done;
+            let n = EARLY[usize::from(running)].fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
-                tracing::warn!(
-                    early_resets = n,
-                    submission = last,
-                    finished,
-                    "a host list reset before its last submission finished (scratch and kept objects reused while the card may read them)"
-                );
+                if running {
+                    tracing::warn!(
+                        resets = n,
+                        submission = last,
+                        fence_value = value,
+                        fence_done = done,
+                        "a host list reset while the card still runs its last submission (scratch and kept objects reused under it)"
+                    );
+                } else {
+                    tracing::info!(
+                        resets = n,
+                        submission = last,
+                        finished,
+                        "a host list reset before its submission was counted finished; the card had run it"
+                    );
+                }
             }
         }
         self.changed_something();
