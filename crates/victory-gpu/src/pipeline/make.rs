@@ -48,6 +48,11 @@ pub(crate) struct Pending {
     scene_input: bool,
     /// Why this pipeline is intentionally skipped (e.g. RT resolve without BVH).
     left_out: Option<&'static str>,
+    /// Claimed by the thread that makes it; the others wait for it.
+    building: AtomicBool,
+    /// The worker making it died ([`watchdog`]): it is never made, and
+    /// whoever asks for it goes without, as for a pipeline the host refused.
+    lost: AtomicBool,
 }
 
 fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
@@ -129,7 +134,11 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders, skip_hashes);
+        let key = key.finalize().to_hex()[..32].to_owned();
+        let left_out = left_out(&shaders, skip_hashes).or_else(|| {
+            super::library::lost(&key)
+                .then_some("killed a pipeline worker in an earlier run (lost-pipelines.txt)")
+        });
         Pending {
             screen,
             scene_input,
@@ -139,8 +148,10 @@ impl Pending {
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
+            building: AtomicBool::new(false),
+            lost: AtomicBool::new(false),
         }
     }
 
@@ -149,13 +160,28 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
-            let _building = crate::timeline::span("pipeline: build a host pipeline");
-            let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-            made
-        });
+        // One thread makes it; the others wait for it to be made or lost (a
+        // `get_or_init` behind a thread that died would wait for ever).
+        if self.made.get().is_none() && !self.lost.load(Ordering::Relaxed) {
+            if self.building.swap(true, Ordering::AcqRel) {
+                let (lock, done) = &DONE;
+                let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while self.made.get().is_none() && !self.lost.load(Ordering::Relaxed) {
+                    held = done
+                        .wait_timeout(held, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                return;
+            }
+            self.made.get_or_init(|| {
+                let _building = crate::timeline::span("pipeline: build a host pipeline");
+                let began = Instant::now();
+                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+                made
+            });
+        }
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -168,6 +194,9 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if p.lost.load(Ordering::Relaxed) => {
+            Some("its worker died making it (lost-pipelines.txt)".into())
+        }
         None => Some(p.left_out.unwrap_or("being made").into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -233,7 +262,7 @@ pub(crate) fn waiting() -> u64 {
 /// The host pipeline if it is made (or is made within the frame's budget);
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
-    if p.left_out.is_some() {
+    if p.left_out.is_some() || p.lost.load(Ordering::Relaxed) {
         return None;
     }
     // A still-pending pipeline was requested by the title too. Prewarm it
@@ -251,7 +280,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
-    if p.left_out.is_some() {
+    if p.left_out.is_some() || p.lost.load(Ordering::Relaxed) {
         return false;
     }
     p.make();
@@ -314,7 +343,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -497,7 +526,20 @@ fn worker_count_for(asked: Option<usize>, processors: usize, limited_ram: bool) 
     }
 }
 
-/// Starts the workers ([`worker_count`]) on first use.
+/// Each worker's stack: Rust's default unless `VICTORY_PIPELINE_STACK_MB`
+/// asks for another size (a larger one did not help the pipelines that
+/// kill workers under Proton: vkd3d-proton recursed without end on them,
+/// through 1 GiB; see [`watchdog`]).
+fn worker_stack() -> Option<usize> {
+    std::env::var("VICTORY_PIPELINE_STACK_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&mb| (2..=4096).contains(&mb))
+        .map(|mb| mb << 20)
+}
+
+/// Starts the workers ([`worker_count`]) on first use, and the
+/// [`watchdog`] that replaces one that dies.
 fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
@@ -512,43 +554,162 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
-            }
+            running |= spawn_worker(i, i >= workers);
+        }
+        if running {
+            watchdog();
         }
         running
     })
+}
+
+/// A worker of ours: its thread (a handle of its own, to tell it has
+/// ended), what it takes, and the pipeline it is making.
+struct Worker {
+    thread: usize,
+    index: usize,
+    screens_only: bool,
+    making: Option<Arc<Pending>>,
+}
+
+static WORKERS: Mutex<Vec<Worker>> = Mutex::new(Vec::new());
+
+/// Whether worker `index` started.
+fn spawn_worker(index: usize, screens_only: bool) -> bool {
+    let mut builder = std::thread::Builder::new().name(format!("victory-pipelines-{index}"));
+    if let Some(size) = worker_stack() {
+        builder = builder.stack_size(size);
+    }
+    let spawned = builder.spawn(move || {
+        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+        use windows::Win32::System::Threading::*;
+        // Below the title's own threads (loading, recording),
+        // and the streaming one, which is below normal itself
+        // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+        let lowest =
+            !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+        let mut thread = HANDLE::default();
+        // SAFETY: plain calls on our own thread and process.
+        let duplicated = unsafe {
+            let priority = if lowest {
+                THREAD_PRIORITY_LOWEST
+            } else {
+                THREAD_PRIORITY_BELOW_NORMAL
+            };
+            let _ = SetThreadPriority(GetCurrentThread(), priority);
+            DuplicateHandle(
+                GetCurrentProcess(),
+                GetCurrentThread(),
+                GetCurrentProcess(),
+                &mut thread,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+            .is_ok()
+        };
+        let slot = |f: &mut dyn FnMut(&mut Worker)| {
+            let mut workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = workers.iter_mut().find(|w| w.thread == thread.0 as usize) {
+                f(w);
+            }
+        };
+        if duplicated {
+            WORKERS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(Worker {
+                    thread: thread.0 as usize,
+                    index,
+                    screens_only,
+                    making: None,
+                });
+        }
+        loop {
+            let p = next(screens_only);
+            slot(&mut |w| w.making = Some(p.clone()));
+            p.make();
+            slot(&mut |w| w.making = None);
+            finished(&p);
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+        return false;
+    }
+    true
+}
+
+/// A pipeline taken from the queue is made, or lost.
+fn finished(p: &Pending) {
+    if p.was_slow.load(Ordering::Relaxed) {
+        let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        queue.slow_now -= 1;
+        AVAILABLE.notify_all();
+    }
+    if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+        drained();
+    } else {
+        super::library::save(false);
+    }
+}
+
+/// Looks at the workers every quarter of a second. One whose thread has
+/// ended died making a pipeline (under Proton, vkd3d-proton recursing
+/// until the stack ran out, `library::LOST_FILE`): that pipeline is lost,
+/// written down so later starts leave it out, and another worker takes the
+/// dead one's place. Before this, the dead workers' pipelines stayed
+/// "being made" for the whole run and the queue behind them with them.
+fn watchdog() {
+    let _ = std::thread::Builder::new().name("victory-pipelines-watch".into()).spawn(|| {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        let mut replaced = 0u32;
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            let dead: Vec<Worker> = {
+                let mut workers = WORKERS.lock().unwrap_or_else(|e| e.into_inner());
+                let mut dead = Vec::new();
+                let mut i = 0;
+                while i < workers.len() {
+                    // SAFETY: a handle of ours, closed only below.
+                    if unsafe { WaitForSingleObject(HANDLE(workers[i].thread as *mut _), 0) } == WAIT_OBJECT_0 {
+                        dead.push(workers.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+                dead
+            };
+            for w in dead {
+                // SAFETY: the handle the worker duplicated for us.
+                let _ = unsafe { CloseHandle(HANDLE(w.thread as *mut _)) };
+                if let Some(p) = &w.making {
+                    p.lost.store(true, Ordering::Relaxed);
+                    super::library::note_lost(&p.key);
+                    tracing::warn!(
+                        worker = w.index,
+                        key = %p.key,
+                        shaders = %hashes(p),
+                        "a pipeline worker died making a pipeline: left out from now on (lost-pipelines.txt), the worker replaced"
+                    );
+                    {
+                        let (lock, done) = &DONE;
+                        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        done.notify_all();
+                    }
+                    finished(p);
+                } else {
+                    tracing::warn!(worker = w.index, "a pipeline worker ended between pipelines: replaced");
+                }
+                // (A worker that keeps dying is not replaced past this.)
+                replaced += 1;
+                if replaced <= 64 {
+                    spawn_worker(w.index, w.screens_only);
+                }
+            }
+        }
+    });
 }
 
 /// The most pipelines waiting at once since the workers last ran out.

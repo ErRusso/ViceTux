@@ -24,6 +24,9 @@ use crate::crash::{MAX_FRAMES, locate, unwind_into};
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
 pub fn dump_stacks_on_schedule() {
+    if let Ok(prefix) = std::env::var("VICTORY_STACKS_OF") {
+        watch_deep(prefix);
+    }
     let Ok(list) = std::env::var("VICTORY_STACKS") else {
         return;
     };
@@ -101,8 +104,16 @@ pub(crate) fn other_threads() -> Vec<u32> {
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
 pub fn dump_stacks() {
+    use std::fmt::Write as _;
     let ids = other_threads();
-    eprintln!("VIctory: stacks of {} threads", ids.len());
+    // Also to the log in one record: a build for the windows subsystem has
+    // no stderr under Wine, where `VICTORY_LOG_FILE` still gets it.
+    let mut all = String::new();
+    let mut say = |line: String| {
+        eprintln!("{line}");
+        let _ = writeln!(all, "{line}");
+    };
+    say(format!("VIctory: stacks of {} threads", ids.len()));
     for id in ids {
         // SAFETY: opens a thread of our own process.
         let thread = unsafe {
@@ -116,17 +127,130 @@ pub fn dump_stacks() {
             continue;
         }
         let (frames, (priority, base, affinity)) = frames_of(thread);
-        eprintln!(
+        say(format!(
             "  thread {id} \"{}\" start {} priority {priority} (base {base}) affinity {affinity:#x}",
             name_of(thread),
             locate(start_of(thread))
-        );
+        ));
         for (i, pc) in frames.into_iter().enumerate() {
-            eprintln!("    #{i:<2} {}", locate(pc as usize));
+            say(format!("    #{i:<2} {}", locate(pc as usize)));
         }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
+    tracing::info!("thread stacks:\n{all}");
+}
+
+/// `VICTORY_STACKS_OF=<name prefix>`: the threads whose names begin so are
+/// looked at every few milliseconds for the first minute, and the first
+/// time each is found more than 1 MiB down its stack, its frames are logged
+/// (where a thread recursed until it ran out of stack: Wine says only where
+/// the last fault was taken).
+fn watch_deep(prefix: String) {
+    const DEEP: usize = 1 << 20;
+    let _ = std::thread::Builder::new()
+        .name("victory-stacks-of".into())
+        .spawn(move || {
+            let start = std::time::Instant::now();
+            let mut said: Vec<u32> = Vec::new();
+            let mut watched: Vec<(u32, HANDLE, String)> = Vec::new();
+            let mut looked = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            while start.elapsed() < std::time::Duration::from_secs(60) {
+                if looked.elapsed() > std::time::Duration::from_millis(100) {
+                    looked = std::time::Instant::now();
+                    for id in other_threads() {
+                        if watched.iter().any(|w| w.0 == id) {
+                            continue;
+                        }
+                        // SAFETY: opens a thread of our own process.
+                        let thread = unsafe {
+                            OpenThread(
+                                THREAD_SUSPEND_RESUME
+                                    | THREAD_GET_CONTEXT
+                                    | THREAD_QUERY_INFORMATION,
+                                0,
+                                id,
+                            )
+                        };
+                        if thread.is_null() {
+                            continue;
+                        }
+                        let name = name_of(thread);
+                        if name.starts_with(&prefix) {
+                            watched.push((id, thread, name));
+                        } else {
+                            // SAFETY: we opened it.
+                            unsafe { CloseHandle(thread) };
+                        }
+                    }
+                }
+                for (id, thread, name) in &watched {
+                    if said.contains(id) {
+                        continue;
+                    }
+                    if let Some((depth, frames)) = deep_frames(*thread, DEEP) {
+                        said.push(*id);
+                        let mut all =
+                            format!("thread {id} \"{name}\" {depth} bytes down its stack:");
+                        for (i, pc) in frames.into_iter().enumerate() {
+                            all.push_str(&format!("\n    #{i:<2} {}", locate(pc as usize)));
+                        }
+                        tracing::warn!("{all}");
+                        eprintln!("VIctory: {all}");
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        });
+}
+
+/// The thread's frames, and how far down its stack it is, if past `deep`.
+fn deep_frames(thread: HANDLE, deep: usize) -> Option<(usize, Vec<u64>)> {
+    // (Taken before the suspension: the thread may hold the heap lock.)
+    let mut frames = Vec::with_capacity(MAX_FRAMES);
+    let mut info: BasicInfo = BasicInfo {
+        exit_status: 0,
+        teb: std::ptr::null(),
+        client_id: [0; 2],
+        affinity: 0,
+        priority: 0,
+        base_priority: 0,
+    };
+    // SAFETY: a thread of this process that is not this one.
+    if unsafe { SuspendThread(thread) } == u32::MAX {
+        return None;
+    }
+    // SAFETY: writes `info`, whose layout and size are the system's.
+    let status = unsafe {
+        NtQueryInformationThread(
+            thread,
+            ThreadBasicInformation,
+            (&raw mut info).cast(),
+            size_of::<BasicInfo>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    let mut found = None;
+    if status == 0 && !info.teb.is_null() {
+        // SAFETY: as in [`frames_of`].
+        let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+        // SAFETY: zeroed is a valid CONTEXT.
+        let mut context = Aligned(unsafe { std::mem::zeroed() });
+        context.0.ContextFlags = CONTEXT_FULL_AMD64;
+        // SAFETY: the thread is suspended; the frames' room is taken before.
+        unsafe {
+            if GetThreadContext(thread, &mut context.0) != 0 {
+                let depth = high.saturating_sub(context.0.Rsp as usize);
+                if depth > deep {
+                    unwind_into(context.0, low, high, &mut frames);
+                    found = Some(depth);
+                }
+            }
+        }
+    }
+    // SAFETY: suspended above.
+    unsafe { ResumeThread(thread) };
+    found.map(|depth| (depth, frames))
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).

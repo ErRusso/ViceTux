@@ -787,6 +787,64 @@ pub(crate) fn note_time(key: &str, ms: u64) {
     }
 }
 
+/// Title pipelines whose making killed the worker making it, one key a
+/// line: under Proton, vkd3d-proton recursed until the thread's stack ran
+/// out on some of them, whatever its size (1 GiB tried, RTX 4060, Proton
+/// Experimental 11.0-20261112 and GE-Proton11-14). They are left out from
+/// the next start on, as a host's refusal is. Delete the file (it is beside
+/// the library) to try them again, after a Proton update for one.
+const LOST_FILE: &str = "lost-pipelines.txt";
+static LOST: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+fn lost_ones() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
+    let mut lost = LOST.lock().unwrap_or_else(|e| e.into_inner());
+    if lost.is_none() {
+        let listed = DIR
+            .get()
+            .and_then(|dir| std::fs::read_to_string(dir.join(LOST_FILE)).ok())
+            .unwrap_or_default();
+        let set: HashSet<String> = listed
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !set.is_empty() {
+            tracing::warn!(
+                pipelines = set.len(),
+                file = LOST_FILE,
+                "title pipelines left out: making them killed a pipeline worker in an earlier run"
+            );
+        }
+        *lost = Some(set);
+    }
+    lost
+}
+
+/// Whether making the title pipeline with `key` killed a worker before.
+pub(crate) fn lost(key: &str) -> bool {
+    lost_ones().as_ref().is_some_and(|s| s.contains(key))
+}
+
+/// Making the title pipeline with `key` killed a worker: kept for the next
+/// starts at once (the run may not end cleanly).
+pub(crate) fn note_lost(key: &str) {
+    use std::io::Write as _;
+    let mut lost = lost_ones();
+    if !lost.get_or_insert_default().insert(key.to_owned()) {
+        return;
+    }
+    let Some(dir) = DIR.get() else { return };
+    let written = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(LOST_FILE))
+        .and_then(|mut f| writeln!(f, "{key}"));
+    if let Err(error) = written {
+        tracing::warn!(%error, file = LOST_FILE, "a lost pipeline not written down");
+    }
+}
+
 /// Title pipeline keys requested by draws or dispatches (this run and the last).
 static USED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 static USED_CHANGED: AtomicBool = AtomicBool::new(false);
