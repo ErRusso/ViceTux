@@ -154,7 +154,8 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files });
+    let slow = slow_listed(&name, &std::env::var("VICTORY_DSTORAGE_SLOW").unwrap_or_default());
+    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, slow });
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{name}", file as usize));
     }
@@ -284,6 +285,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     files: Files,
+    /// On a slow disk ([`slow_listed`]).
+    slow: bool,
 }
 
 /// How files are read (`VICTORY_DSTORAGE_IO`).
@@ -335,7 +338,11 @@ impl Files {
             Io::Overlapped => 1,
             Io::Handles | Io::Direct => workers,
         };
-        Files { first, others: (0..others).map(|_| OnceLock::new()).collect(), io }
+        Files {
+            first,
+            others: (0..others).map(|_| OnceLock::new()).collect(),
+            io,
+        }
     }
 
     #[cfg(test)]
@@ -361,6 +368,44 @@ impl Files {
             (file, _) => file.unwrap_or(&self.first).seek_read(out, offset),
         }
     }
+}
+
+/// How many reads of slow files run at once (`VICTORY_DSTORAGE_SLOW_MAX`;
+/// 0: no cap). A hard disk does a few reads at once no slower, and more
+/// only seek back and forth between them.
+fn slow_max() -> usize {
+    match std::env::var("VICTORY_DSTORAGE_SLOW_MAX").ok().and_then(|v| v.trim().parse().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => 4,
+    }
+}
+
+/// How far into a lane a start looks for a read of a fast file.
+const SLOW_SCAN: usize = 256;
+
+/// Whether `name` (a path the title opens, on the game's drive) is one of
+/// the game's entries the launcher names as on a slow disk
+/// (`VICTORY_DSTORAGE_SLOW`, comma-separated paths from the game's root), or
+/// under one. Timing reads did not tell the disks apart: the texture tiles'
+/// reads on an SSD take as long while the kernel writes into guarded
+/// title memory, and capping them left workers idle.
+fn slow_listed(name: &str, list: &str) -> bool {
+    let norm = |p: &str| p.trim().replace('\\', "/").trim_matches('/').to_ascii_lowercase();
+    let name = norm(name.split_once(':').map_or(name, |(_, rest)| rest));
+    list.split(',').map(norm).filter(|e| !e.is_empty()).any(|entry| {
+        name == entry || name.strip_prefix(&entry).is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Whether a request reads a file on a slow disk ([`slow_listed`]).
+fn file_is_slow(request: &Request) -> bool {
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return false;
+    }
+    // SAFETY: a file object we created; the title keeps it open until its
+    // requests complete.
+    unsafe { &*request.source.cast::<Instance<File>>() }.state.slow
 }
 
 /// A number for this thread: 0 for the first that asks, and so on.
@@ -565,6 +610,11 @@ struct Lanes {
     staging: u64,
     /// A start waited for staging space since the last finish.
     starved: bool,
+    /// Reads of slow files running, the most at once, and what makes a
+    /// read slow ([`file_is_slow`]; tests set their own).
+    slow_running: usize,
+    slow_max: usize,
+    slow: fn(&Request) -> bool,
     /// Weighted round robin: each class's virtual time (bytes × cost), and
     /// the time of the last start; within a class, the lane clock of the
     /// last start.
@@ -609,6 +659,8 @@ struct Job {
     request: Request,
     note: Note,
     staging: u64,
+    /// A read of a slow file, counted in [`Lanes::slow_running`].
+    slow: bool,
 }
 
 // SAFETY: as for `Lane`.
@@ -629,6 +681,9 @@ fn scheduler() -> Option<&'static Scheduler> {
                     staged: 0,
                     staging: STAGING,
                     starved: false,
+                    slow_running: 0,
+                    slow_max: slow_max(),
+                    slow: file_is_slow,
                     clock: [0; 3],
                     now: 0,
                     lane_now: [0; 3],
@@ -854,23 +909,37 @@ impl Lanes {
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
-        let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
-        let (_, _, id) = busy()
-            .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+        // With the slow files' share of the workers taken, a lane's next
+        // read is its first of a fast file: one slow disk's reads (seeking,
+        // tens of milliseconds each) held every worker while thousands of
+        // reads from an SSD waited behind them, up to 21 s.
+        let capped = self.slow_running >= self.slow_max;
+        let slow = self.slow;
+        let next = |l: &Lane| -> Option<usize> {
+            if !capped {
+                return (!l.reads.is_empty()).then_some(0);
+            }
+            l.reads.iter().take(SLOW_SCAN).position(|(_, r)| !slow(&r.request))
+        };
+        let ready = || self.lanes.iter().filter_map(|(&id, l)| Some((id, l, next(l)?)));
+        let (_, class) = ready().map(|(_, l, _)| (self.clock[l.class], l.class)).min()?;
+        let (_, _, id, at) = ready()
+            .filter(|(_, l, _)| l.class == class)
+            .map(|(id, l, at)| (l.clock, l.reads[at].0, id, at))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
+        let &(seq, Read { request, note }) = lane.reads.get(at)?;
         let staging = staging_bytes(&request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        lane.reads.remove(at);
         lane.running.insert(seq);
         self.staged += staging;
+        let is_slow = slow(&request);
+        self.slow_running += usize::from(is_slow);
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
         self.now = self.clock[class];
         self.clock[class] += size * COST[class];
@@ -882,11 +951,13 @@ impl Lanes {
             request,
             note,
             staging,
+            slow: is_slow,
         })
     }
 
     fn finish(&mut self, job: &Job, result: Result<(), HRESULT>) {
         self.staged -= job.staging;
+        self.slow_running -= usize::from(job.slow);
         if let Some(lane) = self.lanes.get_mut(&job.lane) {
             lane.running.remove(&job.seq);
             if let Err(hr) = result {
@@ -2245,6 +2316,9 @@ mod tests {
             staged: 0,
             staging,
             starved: false,
+            slow_running: 0,
+            slow_max: usize::MAX,
+            slow: |_| false,
             clock: [0; 3],
             now: 0,
             lane_now: [0; 3],
@@ -2285,6 +2359,60 @@ mod tests {
         assert_eq!(started[1] + started[2], 300, "{started:?}");
         assert_eq!(started[0], 30, "{started:?}");
         assert!(started[1].abs_diff(started[2]) <= 1, "{started:?}");
+    }
+
+    /// The launcher names the game's entries on a slow disk; a file is
+    /// slow when its path is one of them or under one.
+    #[test]
+    fn files_under_a_listed_entry_are_slow() {
+        let list = "pack, anim.rpf,Packs.rpf";
+        assert!(slow_listed(r"G:\pack\core_bvh4\core_bvh4.rpf", list));
+        assert!(slow_listed(r"G:\anim.rpf", list));
+        assert!(slow_listed(r"g:\PACKS.RPF", list), "case does not matter");
+        assert!(!slow_listed(r"G:\data\ttdb\maps\ttdb_maps_7_7.ttpf", list));
+        assert!(!slow_listed(r"G:\packages.rpf", list), "a whole name, not a prefix of one");
+        assert!(!slow_listed(r"G:\anim.rpf", ""));
+    }
+
+    /// Reads of a slow file (a hard disk's) past the cap wait; the fast
+    /// reads behind them start, and a status still waits for every read
+    /// before it.
+    #[test]
+    fn slow_reads_past_the_cap_let_fast_reads_by() {
+        let mut l = lanes(STAGING);
+        l.slow_max = 2;
+        // Tag 1: a slow file's read (the classifier below).
+        l.slow = |r| r.tag == 1;
+        l.lanes.insert(0, Lane::new(0, 64));
+        let tagged = |l: &mut Lanes, tag| {
+            read(l, 0, 0, 16);
+            match l.lanes.get_mut(&0).unwrap().unsubmitted.last_mut() {
+                Some(Command::Read(r)) => r.request.tag = tag,
+                _ => unreachable!(),
+            }
+        };
+        for _ in 0..3 {
+            tagged(&mut l, 1);
+        }
+        tagged(&mut l, 0);
+        tagged(&mut l, 0);
+        l.submit(0, false);
+        let a = l.start().unwrap();
+        let b = l.start().unwrap();
+        assert_eq!((a.request.tag, b.request.tag), (1, 1));
+        // Two slow reads run: the third waits, the fast ones go by.
+        let c = l.start().unwrap();
+        let d = l.start().unwrap();
+        assert_eq!((c.request.tag, d.request.tag), (0, 0), "fast reads behind the capped slow one");
+        assert!(l.start().is_none(), "only the capped slow read is left");
+        l.finish(&a, Ok(()));
+        let e = l.start().unwrap();
+        assert_eq!(e.request.tag, 1, "a slow read starts once one ends");
+        assert_eq!(l.slow_running, 2);
+        for job in [&b, &c, &d, &e] {
+            l.finish(job, Ok(()));
+        }
+        assert_eq!(l.slow_running, 0);
     }
 
     #[test]

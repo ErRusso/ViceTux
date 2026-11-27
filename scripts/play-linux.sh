@@ -153,6 +153,16 @@ else
     # The least bounced light anywhere: rooms kept some light with their lamps off screen.
     export VICTORY_AMBIENT_FLOOR="${AMBIENT_FLOOR:-0.35}"
 fi
+# The game's entries on a spinning disk (fast-copy.sh links them): the
+# streaming reads at most a few of them at once (VICTORY_DSTORAGE_SLOW_MAX),
+# so the reads from the SSD do not wait behind a seeking disk's.
+slow=()
+for entry in "$game_dir"/* "$game_dir"/pack/*; do
+    [[ -L $entry ]] || continue
+    dev="$(findmnt -no SOURCE --target "$(readlink -f "$entry")" 2>/dev/null | sed 's/\[.*//')"
+    [[ -n $dev && "$(lsblk -ndo ROTA "$dev" 2>/dev/null | tr -d ' ')" == 1 ]] && slow+=("${entry#"$game_dir"/}")
+done
+if ((${#slow[@]})); then export VICTORY_DSTORAGE_SLOW="$(IFS=,; echo "${slow[*]}")"; fi
 [[ $windowed == 0 ]] && export VICTORY_FULLSCREEN=1
 [[ $panel == 1 ]] && export VICTORY_PANEL=1
 # Every run keeps the layer's log (a build for the windows subsystem has no
