@@ -4,7 +4,7 @@
 #   cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 #
 #   scripts/play-linux.sh [--machine 4060|4070|4090] [--console series-s|series-x]
-#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows]] [--cmd run|shaders|warm]
+#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows]] [--breadcrumbs] [--cmd run|shaders|warm]
 #                         [KEY=VALUE ...]   extra VICTORY_* overrides
 #
 # Paths come from the environment (defaults in brackets):
@@ -44,7 +44,7 @@ fi
 build="${VICTORY_BUILD:-diag}"
 victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
 
-machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 rt_shadows=0 cmd=run
+machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 rt_shadows=0 crumbs=0 cmd=run
 extra=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -55,6 +55,7 @@ while [[ $# -gt 0 ]]; do
         --safe) safe=1; shift ;;
         --raytracing) rt=1; shift ;;
         --rt-shadows) rt_shadows=1; shift ;;
+        --breadcrumbs) crumbs=1; shift ;;
         --cmd) cmd="$2"; shift 2 ;;
         VICTORY_*=*) extra+=("$1"); shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -144,7 +145,7 @@ if [[ $rt == 1 ]]; then
 else
     export VICTORY_AMBIENT=1.0 VICTORY_AMBIENT_SETTLE=4000,0 VICTORY_AMBIENT_AIR=2
     # The least bounced light anywhere: rooms kept some light with their lamps off screen.
-    export VICTORY_AMBIENT_FLOOR="${AMBIENT_FLOOR:-0.1}"
+    export VICTORY_AMBIENT_FLOOR="${AMBIENT_FLOOR:-0.35}"
 fi
 [[ $windowed == 0 ]] && export VICTORY_FULLSCREEN=1
 [[ $panel == 1 ]] && export VICTORY_PANEL=1
@@ -167,6 +168,14 @@ export PROTON_LOG="${PROTON_LOG:-0}"
 # Larger shader cache for the thousands of translated pipelines; no frame cap.
 export __GL_SHADER_DISK_CACHE_SIZE=10737418240 __GL_SYNC_TO_VBLANK=0
 export VKD3D_CONFIG="${VKD3D_CONFIG:-}" WINEDEBUG="${WINEDEBUG:--all}"
+# --breadcrumbs: vkd3d-proton marks the command lists it sends, and on a GPU
+# fault (an NVIDIA Xid 31 in the kernel's log, then the title's "GPU Loc Sig"
+# watchdog 30 s later) writes which command list and draw or dispatch was
+# running to its log. Costs some speed: for finding a crash only.
+if [[ $crumbs == 1 ]]; then
+    export VKD3D_CONFIG="${VKD3D_CONFIG:+$VKD3D_CONFIG,}breadcrumbs"
+    export VKD3D_DEBUG="${VKD3D_DEBUG:-err}" VKD3D_LOG_FILE="$(winpath "$home/logs/$(date +%Y%m%d-%H%M%S)-vkd3d.log")"
+fi
 # vkd3d-proton keeps its pipeline cache in the working directory otherwise (the repository).
 export VKD3D_SHADER_CACHE_PATH="${VKD3D_SHADER_CACHE_PATH:-$(winpath "$home/vkd3d")}"
 mkdir -p "$home/vkd3d"
