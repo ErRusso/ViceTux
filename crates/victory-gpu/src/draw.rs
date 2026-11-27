@@ -891,6 +891,9 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+/// Dispatches of the ray chain left for the next frame (`VICTORY_RT_LOW`,
+/// [`crate::pipeline::skips_this_frame`]); not drops.
+pub(crate) static ALTERNATED: AtomicU64 = AtomicU64::new(0);
 
 /// `n` consecutive dynamic slots of `host` ([`crate::descriptor::host::HostHeap::dynamic`]).
 /// With none free, the flights in the air are landed first, which gives
@@ -3282,6 +3285,10 @@ impl State {
             }
             return;
         }
+        if crate::pipeline::skips_this_frame(self.pipeline as This) {
+            ALTERNATED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -4544,6 +4551,10 @@ impl State {
             return false;
         }
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
+            return false;
+        }
+        if crate::pipeline::skips_this_frame(self.pipeline as This) {
+            ALTERNATED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         const DRAW: u32 = 0;

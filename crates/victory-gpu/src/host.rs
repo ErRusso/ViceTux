@@ -10338,6 +10338,13 @@ impl Meter {
                         );
                     }
                 }
+                let alternated = crate::draw::ALTERNATED.swap(0, Ordering::Relaxed);
+                if alternated > 0 {
+                    tracing::info!(
+                        "ray chain left for the next frame: {:.1}/frame (VICTORY_RT_LOW)",
+                        alternated as f64 / frames
+                    );
+                }
         });
         if self.caption.is_none() {
             // The window's own text, read without a message.
