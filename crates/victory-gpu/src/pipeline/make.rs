@@ -120,10 +120,20 @@ fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static 
     {
         return Some("traces ray-traced shadows without BVH under Wine, left out");
     }
+    if let Some(why) = rt_low_left_out(shaders, super::rt_low()) {
+        return Some(why);
+    }
     if super::skipped_in_list(shaders, skip_hashes).is_some() {
         return Some("skipped by VICTORY_SKIP_PIPELINES");
     }
     None
+}
+
+/// With `on` (`VICTORY_RT_LOW=1`, `--rt-low`): the reflection traces
+/// (`CS_PPR_Raytrace`, and its fallback) left out, for the time of an 8 GB
+/// card; the bounced light keeps its rays.
+fn rt_low_left_out(shaders: &[Arc<Shader>], on: bool) -> Option<&'static str> {
+    (on && named(shaders, b"CS_PPR_Raytrace")).then_some("traces reflections, left out (VICTORY_RT_LOW)")
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold
@@ -779,6 +789,15 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reflection_traces_are_left_out_with_rt_low() {
+        let traces = [crate::pipeline::shader("compute", b"..CS_PPR_RaytraceFallback_1234..")];
+        assert_eq!(rt_low_left_out(&traces, true), Some("traces reflections, left out (VICTORY_RT_LOW)"));
+        assert_eq!(rt_low_left_out(&traces, false), None);
+        let other = [crate::pipeline::shader("compute", b"..CS_CombinedReflections..")];
+        assert_eq!(rt_low_left_out(&other, true), None);
+    }
 
     #[test]
     fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
