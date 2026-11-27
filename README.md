@@ -149,11 +149,17 @@ Every run writes the layer's log to `~/.local/share/vice-tay/logs/`.
 
 ## Known problems
 
-- **A crash at the prison cutscene `int_prolo…_int_min`.** The card faults
-  reading an unmapped address (NVIDIA `Xid 31`, an MMU fault in the constant
-  cache) and the title's own watchdog ends it 30 s later ("GPU Loc Sig").
-  Reproducible, same address every run; not found yet. Skipping the cutscene
-  may get past it.
+- **A GPU crash a few minutes into play (worked around).** The card faulted
+  reading an address of the title's space through its constant cache
+  (NVIDIA `Xid 31`, the same address every run) and the title's watchdog
+  ended it ("GPU Loc Sig"). Bisected: it comes from card steps at stage 2
+  (the title's buffer copies done on the card behind submissions in the
+  air). `play-linux.sh` now runs stage 1 (`CARD_STEPS=2` brings stage 2
+  back): no crash in two 9-minute runs, at 13 fps in gameplay instead of
+  16-17. The fault in stage 2 itself is not found yet.
+- **Xwayland keeps memory of every frame shown** (about 120 KB a frame,
+  4 GB an hour; not given back when the game exits, and not from the
+  layer). Restart Xwayland (or log out) between long sessions.
 - **Frame rate.** 15-16 fps in heavy rooms: about 40 ms a frame preparing the
   GPU's work on the CPU, 15-25 ms copying data back, and the 4060 near full.
 - **Lighting without ray tracing** is an estimate: rooms are lit, but flatter
