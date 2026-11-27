@@ -143,6 +143,12 @@ if [[ $safe == 1 ]]; then
     export VICTORY_UNDER_WIDE=0 VICTORY_LAND_ECHO=0
 else
     export VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_INDIRECT_BATCH=2
+    # Windows of the title's private memory read in place: the GPU reads the
+    # title's bytes through a heap opened on them instead of a copy
+    # (vkd3d-proton on NVIDIA refused none; in play 77 windows, 368 MB not
+    # copied, 13.1 fps against 13.0, no fault). Stage 1 only: 2 does not go
+    # with submissions sent ahead (inplace.rs).
+    export VICTORY_INPLACE=1
     # Not play.ps1's NVIDIA VICTORY_PLACED_ORDER=1 VICTORY_PLACED_FILL_REDIRECT=1:
     # here, with card steps at stage 1, gameplay fell from 13.0 to 8.4 fps with
     # them and the textures waiting for their memory from a median of 136 to
