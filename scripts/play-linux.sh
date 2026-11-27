@@ -4,7 +4,7 @@
 #   cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 #
 #   scripts/play-linux.sh [--machine 4060|4070|4090] [--console series-s|series-x]
-#                         [--windowed] [--no-panel] [--safe] [--cmd run|shaders|warm]
+#                         [--windowed] [--no-panel] [--safe] [--raytracing] [--cmd run|shaders|warm]
 #                         [KEY=VALUE ...]   extra VICTORY_* overrides
 #
 # Paths come from the environment (defaults in brackets):
@@ -44,7 +44,7 @@ fi
 build="${VICTORY_BUILD:-diag}"
 victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
 
-machine=auto console=series-s windowed=0 panel=1 safe=0 cmd=run
+machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 cmd=run
 extra=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -53,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         --windowed) windowed=1; shift ;;
         --no-panel) panel=0; shift ;;
         --safe) safe=1; shift ;;
+        --raytracing) rt=1; shift ;;
         --cmd) cmd="$2"; shift 2 ;;
         VICTORY_*=*) extra+=("$1"); shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -127,6 +128,17 @@ if [[ $safe == 1 ]]; then
     export VICTORY_UNDER_WIDE=0 VICTORY_LAND_ECHO=0
 else
     export VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_INDIRECT_BATCH=2
+fi
+# Without rays the bounced light is the ambient stand-in's, estimated from
+# what is on screen: with its default (250 ms, changes of 3x at once) a
+# room went dark the moment the lamps left the screen. Here: all of the
+# estimate, a 4 s mean with no jumps, and the air (the haze) bounded by
+# twice the light around. --raytracing builds the ray-tracing structures
+# (the title's own bounced light and shadows; about a third slower).
+if [[ $rt == 1 ]]; then
+    export VICTORY_BVH_BUILDER=1
+else
+    export VICTORY_AMBIENT=1.0 VICTORY_AMBIENT_SETTLE=4000,0 VICTORY_AMBIENT_AIR=2
 fi
 [[ $windowed == 0 ]] && export VICTORY_FULLSCREEN=1
 [[ $panel == 1 ]] && export VICTORY_PANEL=1
