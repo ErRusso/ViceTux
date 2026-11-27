@@ -15,6 +15,8 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+home_default="$HOME/.local/share/vice-tay"
+home="${VICTORY_HOME:-$home_default}"
 # ~/Games/GTA6-fast: the dump as links, with the archives the title streams
 # most (levels.rpf, the texture tiles of data/ttdb) copied to the NVMe drive:
 # from the hard disk, textures waited a mean 23 s for their data.
@@ -25,8 +27,20 @@ if [[ -z ${VICTORY_GAME_DIR:-} && -f "$fast/levels.rpf" && ! -L "$fast/levels.rp
 else
     game_dir="${VICTORY_GAME_DIR:-$hdd}"
 fi
-home="${VICTORY_HOME:-$HOME/.local/share/vice-tay}"
-proton="${PROTON:-$HOME/.steam/steam/steamapps/common/Proton - Experimental/proton}"
+# A Proton Experimental whose wineserver keeps mapped views in a tree
+# (kroeeee-eeee/VIctory-Linux-Proton-Wine-7900XT-XTX, linux/wineserver):
+# links to the installed one, its own files/bin. With the stock server every
+# map and unmap walks all of the title's tens of thousands of views, and the
+# write watch took 25-90 ms a frame here. Built for experimental-11.0-20261112
+# (wine 5b557605); after a Proton update rebuild it, or PROTON= the stock one.
+viewtree="$home_default/proton-experimental-viewtree/proton"
+if [[ -z ${PROTON:-} && -x "$viewtree" ]] \
+    && cmp -s "$(dirname "$viewtree")/built-against-version" "$HOME/.steam/steam/steamapps/common/Proton - Experimental/version"; then
+    proton="$viewtree"
+else
+    [[ -z ${PROTON:-} && -x "$viewtree" ]] && echo "Proton Experimental was updated: the view-tree wineserver is for another build; using the stock one."
+    proton="${PROTON:-$HOME/.steam/steam/steamapps/common/Proton - Experimental/proton}"
+fi
 build="${VICTORY_BUILD:-diag}"
 victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
 
@@ -128,6 +142,8 @@ prefix="${VICTORY_PREFIX:-$home/prefix}"
 pfx="$prefix/pfx"
 mkdir -p "$prefix"
 export STEAM_COMPAT_DATA_PATH="$prefix"
+# Wine finds its server beside its own binary; said outright for the tree one.
+[[ -x "$proton_dir/files/bin/wineserver" ]] && export WINESERVER="$proton_dir/files/bin/wineserver"
 export STEAM_COMPAT_CLIENT_INSTALL_PATH="${STEAM_COMPAT_CLIENT_INSTALL_PATH:-$HOME/.steam/steam}"
 export PROTON_LOG="${PROTON_LOG:-0}"
 # Larger shader cache for the thousands of translated pipelines; no frame cap.
