@@ -301,6 +301,50 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|programs| programs.iter().any(victory_shader::spill::is_spilled))
 }
 
+/// The bounced light's ray chain, by the names in the programs' containers:
+/// the per-frame clears and binning of rays, the traces and the shading of
+/// their hits. With `VICTORY_RT_LOW=1` they run every second frame
+/// ([`skips_this_frame`]); what reads their results (temporal resolves,
+/// upscales, final gathers) runs every frame on the last ones. The
+/// structure builder is not among them: it runs every frame.
+#[cfg(windows)]
+const ALTERNATE: [&[u8]; 9] = [
+    b"CS_ClearRayCounts",
+    b"CS_ClearRayBins",
+    b"CS_GenerateRayBin",
+    b"CS_SortRayTiles",
+    b"CS_ClassifyRayTiles",
+    b"CS_ResetRayTileArgs",
+    b"CS_ScreenProbes_TraceRays",
+    b"CS_RaytraceVBuffer",
+    b"CS_RaytracingResolve",
+];
+
+/// Whether a container names a program of the ray chain ([`ALTERNATE`]).
+#[cfg(windows)]
+fn alternate_named(container: &[u8]) -> bool {
+    ALTERNATE.iter().any(|name| container.windows(name.len()).any(|w| w == *name))
+}
+
+/// The frames the ray chain is left for the next: the odd ones.
+#[cfg(windows)]
+fn alternate_frame(frame: u64) -> bool {
+    frame % 2 == 1
+}
+
+/// `VICTORY_RT_LOW=1`: the ray chain every second frame (`--rt-low`).
+#[cfg(windows)]
+pub(crate) fn rt_low() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_LOW").is_some_and(|v| v == "1"))
+}
+
+/// Whether a dispatch of pipeline `this` is left for the next frame.
+#[cfg(windows)]
+pub(crate) fn skips_this_frame(this: This) -> bool {
+    !this.is_null() && pipeline(this).alternate && alternate_frame(crate::frame::current())
+}
+
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
 /// stays in the host's copies and is not copied back into title memory. A
 /// check for a first run of the whole builder: a stage that stores where
@@ -429,6 +473,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Of the bounced light's ray chain, with `VICTORY_RT_LOW=1`
+    /// ([`skips_this_frame`]).
+    #[cfg(windows)]
+    alternate: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -682,6 +730,18 @@ fn hand_out(
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
+    let alternate = rt_low()
+        && !builder
+        && matches!(&shaders[..], [s] if s.stage == "compute" && alternate_named(&s.container));
+    #[cfg(windows)]
+    if alternate {
+        static MARKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = MARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(pipelines = n, "ray chain pipelines run every second frame (VICTORY_RT_LOW)");
+        }
+    }
+    #[cfg(windows)]
     if builder {
         // Another stage: the group is looked at again at its next dispatch.
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -695,6 +755,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        alternate,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
@@ -901,6 +963,43 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn the_bounced_light_ray_chain_is_named() {
+        for name in [
+            "CS_ClearRayCounts",
+            "CS_ClearRayBins",
+            "CS_GenerateRayBins",
+            "CS_GenerateRayBinOffsets",
+            "CS_SortRayTiles",
+            "CS_ClassifyRayTiles",
+            "CS_ResetRayTileArgs",
+            "CS_ScreenProbes_TraceRays_BVH_Shared_ShaderBinning",
+            "CS_RaytraceVBuffer_ShaderBinning",
+            "CS_RaytracingResolve_b1139868_Wrapped",
+        ] {
+            assert!(super::alternate_named(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "CS_ScreenProbes_TemporalResolve",
+            "CS_ScreenProbes_Upscale",
+            "CS_FinalGather_0_1_1_0",
+            "CS_IrradianceCache_SpatialFilter",
+            "CS_TraceShadowRays_Half",
+            "CS_MainBlur",
+        ] {
+            assert!(!super::alternate_named(name.as_bytes()), "{name}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_chain_runs_on_even_frames() {
+        assert!(!super::alternate_frame(0));
+        assert!(super::alternate_frame(1));
+        assert!(!super::alternate_frame(8192));
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn direct_prepare_capture_identifies_an_unset_pipeline() {
