@@ -61,6 +61,32 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
+/// The title's ray-traced shadow passes: distant (directional) shadow
+/// traces, the shadow mask's checkerboard rays and the laser lights'.
+const RT_SHADOW_TRACES: [&[u8]; 3] =
+    [b"CS_RTDistantShadowTrace", b"CS_TraceShadowRays", b"CS_LaserLightShadowRaytracing"];
+
+/// Whether [`RT_SHADOW_TRACES`] are left out: under Wine with no BVH built
+/// (`VICTORY_BVH_BUILDER` unset), unless `VICTORY_RT_SHADOWS=1`. Once the
+/// single-latch translation let vkd3d-proton make them (before, its
+/// compiler died on them), they traced an acceleration structure never
+/// built, and smoke and haze in lit rooms showed brown and dark blotches
+/// (RTX 4060, Proton Experimental 11, the prison canteen). `0` leaves them
+/// out everywhere.
+fn skip_rt_shadows() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        if std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
+            return false;
+        }
+        match std::env::var("VICTORY_RT_SHADOWS").ok().as_deref() {
+            Some("1") => false,
+            Some("0") => true,
+            _ => crate::host::on_wine(),
+        }
+    })
+}
+
 fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
@@ -85,6 +111,11 @@ fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static 
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
+    }
+    if skip_rt_shadows()
+        && RT_SHADOW_TRACES.iter().any(|name| named(shaders, name))
+    {
+        return Some("traces ray-traced shadows without BVH under Wine, left out");
     }
     if super::skipped_in_list(shaders, skip_hashes).is_some() {
         return Some("skipped by VICTORY_SKIP_PIPELINES");
