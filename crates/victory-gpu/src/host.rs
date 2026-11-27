@@ -6858,10 +6858,11 @@ impl Host {
     /// at and what the draws and dispatches in flight there run (or, in
     /// lists that never started, the pipelines they bind).
     fn removal_data(&self, runs: &[&HostList]) -> String {
+        let watched = watched_va();
         let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
-            return String::new();
+            return watched;
         };
-        let mut text = String::new();
+        let mut text = watched;
         let mut fault_va = None;
         // SAFETY: the outputs are the runtime's, valid while the device
         // lives; nodes are walked as linked, histories have their counts.
@@ -12512,4 +12513,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
     }
+}
+
+#[cfg(windows)]
+/// `VICTORY_WATCH_VA=<hex address>`: at a device loss, what lies at that
+/// card address now and what lay there (the same report a DRED page fault
+/// gets). Under vkd3d-proton the runtime gives no faulting address, but the
+/// kernel's log does (NVIDIA's Xid 31 "faulted @"), and it was the same
+/// address run after run.
+fn watched_va() -> String {
+    let Some(va) = std::env::var("VICTORY_WATCH_VA")
+        .ok()
+        .and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x").replace('_', "").as_str(), 16).ok())
+    else {
+        return String::new();
+    };
+    let mut text = format!("; watched address {va:#x}");
+    text.push_str(&crate::shadow::near(va));
+    text.push_str(&crate::descriptor::host::near_heaps(va));
+    #[cfg(feature = "diagnostics")]
+    text.push_str(&crate::book::at_loss(va));
+    text
 }
