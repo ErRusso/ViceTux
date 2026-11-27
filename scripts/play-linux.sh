@@ -143,11 +143,10 @@ if [[ $safe == 1 ]]; then
     export VICTORY_UNDER_WIDE=0 VICTORY_LAND_ECHO=0
 else
     export VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_INDIRECT_BATCH=2
-    # As play.ps1 on NVIDIA: a constant-buffer fill that a small copy at its
-    # place writes into is taken in list order instead of refusing the whole
-    # submission to the card steps (there: submit thread 104.7 -> 50.9 ms a
-    # frame), and a fill behind such a copy reads the copy's source on the card.
-    export VICTORY_PLACED_ORDER=1 VICTORY_PLACED_FILL_REDIRECT=1
+    # Not play.ps1's NVIDIA VICTORY_PLACED_ORDER=1 VICTORY_PLACED_FILL_REDIRECT=1:
+    # here, with card steps at stage 1, gameplay fell from 13.0 to 8.4 fps with
+    # them and the textures waiting for their memory from a median of 136 to
+    # 1,750 (8-minute runs from the prison save, RTX 4060, Proton).
 fi
 # Without rays the bounced light is the ambient stand-in's, estimated from
 # what is on screen: with its default (250 ms, changes of 3x at once) a
