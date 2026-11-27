@@ -861,8 +861,8 @@ static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 /// `RECHECK_FRAMES`.
 static BAKE_PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
-/// Since the start: such ranges kept for a pass; ranges dropped because no
-/// pass took them; slots of placed textures that held bytes of them when a
+/// Since the start: such ranges kept for a pass; ranges compacted when the
+/// queue filled; slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
 /// before the write (out of the queue, or in it after an upload): they are
 /// the ones that kept the bytes from before, and the ones made due when
@@ -875,6 +875,8 @@ pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
 /// two frames on takes those of the next frame with it.
 const PAGE_WRITE_AFTER: u64 = 2;
 
+const MAX_PENDING_TEXTURE_CHANGES: usize = 1 << 15;
+
 /// The bytes of a write the guards do not see are in title memory `[at,
 /// at + len)`: the placed textures there changed with no descriptor
 /// written and nothing mapped. Kept for the next texture pass
@@ -882,25 +884,16 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
     PAGE_WRITES[0].fetch_add(1, Relaxed);
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
+    let compacted = remember_texture_change(&mut ranges, start, end);
+    if compacted != 0 {
+        PAGE_WRITES[1].fetch_add(compacted as u64, Relaxed);
     }
-    if ranges.len() >= MOST {
-        PAGE_WRITES[1].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
@@ -917,7 +910,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// ranges compacted when the queue filled; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -944,28 +937,44 @@ fn stale_rule() -> Rule {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
+    let compacted = remember_texture_change(&mut ranges, start, end);
+    if compacted != 0 {
+        STALE[2].fetch_add(compacted as u64, Relaxed);
+    }
+}
+
+/// Queues a changed range and returns the number of entries compacted.
+fn remember_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> usize {
     if let Some(last) = ranges.last_mut()
         && last.1 == start
     {
         last.1 = end;
-        return;
+        return 0;
     }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
+    let mut compacted = 0;
+    if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
+        compacted = ranges.len();
+        join(ranges);
+        if ranges.len() > MAX_PENDING_TEXTURE_CHANGES / 2 {
+            // Cover pairs of neighboring ranges so the next texture pass
+            // can still find every change without growing the queue.
+            let pairs = ranges.len().div_ceil(2);
+            for pair in 0..pairs {
+                let first = 2 * pair;
+                let last = (first + 1).min(ranges.len() - 1);
+                ranges[pair] = (ranges[first].0, ranges[last].1);
+            }
+            ranges.truncate(pairs);
+        }
     }
     ranges.push((start, end));
+    compacted
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -2802,7 +2811,8 @@ impl HostHeap {
                     continue;
                 }
             }
-            if let Some(kept) = make(&view, self.at(f.index)) {
+            let (kept, deferred) = crate::residency::upload_deferred_during(|| make(&view, self.at(f.index)));
+            if let Some(kept) = kept {
                 #[cfg(feature = "diagnostics")]
                 note_before(f.index, shown, if f.late.is_some() { "shown after its upload" } else { "flip" });
                 self.put(f.index);
@@ -2836,6 +2846,10 @@ impl HostHeap {
                 } else {
                     flipped += 1;
                 }
+            } else if deferred {
+                // The backing can be evicted while a flip is waiting. Let
+                // the texture pass upload the new backing before showing it.
+                self.queue_texture(f.index, true, false, crate::frame::current());
             }
         }
         FLIPPED[0].fetch_add(flipped as u64, Relaxed);
@@ -3714,12 +3728,16 @@ impl HostHeap {
             // read this slot by index, and must not find it ([`show_new_later`]).
             // The slot shows what it showed (or the neutral texture), and the
             // new view when they have all run.
-            if !later
+            let (after, allocation_deferred) = if !later
                 && !self.sampler
                 && show_new_later()
                 && is_texture_view(&view)
-                && let Some(after) = begun_before(&view)
             {
+                crate::residency::upload_deferred_during(|| begun_before(&view))
+            } else {
+                (None, false)
+            };
+            if let Some(after) = after {
                 // Asked again (each draw that reads the slot, each pass)
                 // while it waits: nothing more to do.
                 let own = (std::ptr::from_ref(self) as usize, index, key);
@@ -3756,12 +3774,14 @@ impl HostHeap {
                 note_before(index, shown, if later { "null, waits" } else { "at once" });
             }
             self.quick_is(index, 0);
-            self.made.set(index, if later { 0 } else { key });
-            let kept = if later {
-                None
+            let (kept, deferred) = if later || allocation_deferred {
+                (None, allocation_deferred)
             } else {
-                make_twinned(&view, self.at(index), self.twin(index))
+                crate::residency::upload_deferred_during(|| make_twinned(&view, self.at(index), self.twin(index)))
             };
+            // A null descriptor during an allocation cooldown is still due.
+            let ready_key = if later || (deferred && kept.is_none()) { 0 } else { key };
+            self.made.set(index, ready_key);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.at(index));
             }
@@ -3770,7 +3790,7 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
-            self.quick_is(index, if later { 0 } else { key });
+            self.quick_is(index, ready_key);
             drop(held);
             self.unmake_stale(index, stale);
         }
@@ -5798,17 +5818,73 @@ mod tests {
         };
         assert_ne!(a.ptr, b.ptr);
         assert_ne!(Some(a.ptr), std::thread::spawn(|| staged(false, 0).map(|h| h.ptr)).join().unwrap());
-        let (buffer, _) = host.shared_buffer(1 << 16).unwrap();
+        let (buffer, source) = host.shared_buffer(1 << 16).unwrap();
+        let (result, destination) = host.shared_buffer(64).unwrap();
         let index = heap.dynamic(1).unwrap();
-        let bytes = |at: D3D12_CPU_DESCRIPTOR_HANDLE| {
-            let mut bytes = [0u8; 32];
-            crate::host::read_into(at.ptr as *const u8, &mut bytes).then_some(bytes)
+        assert_eq!(heap.at(index).ptr, a.ptr);
+        assert_ne!(a.ptr, heap.cpu(index).ptr);
+
+        // Verify what the GPU can read instead of dereferencing driver-owned
+        // CPU descriptor handles. A volatile table range keeps the SRV
+        // bounds checks with a version 1.1 root signature.
+        const READ_VIEW: &str = r#"
+            ByteAddressBuffer input : register(t0);
+            RWByteAddressBuffer output : register(u0);
+            [RootSignature("DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), UAV(u0)")]
+            [numthreads(1, 1, 1)]
+            void main() {
+                output.Store3(0, uint3(input.Load(0), input.Load(1020), input.Load(1024)));
+            }
+        "#;
+        let code = crate::host::compile(
+            READ_VIEW,
+            windows::core::s!("main"),
+            windows::core::s!("cs_5_1"),
+        )
+        .expect("compile descriptor readback shader");
+        // SAFETY: the compiled shader and root signature live through pipeline
+        // creation. D3D12 borrows the root pointer in the descriptor.
+        let (root, pipeline) = unsafe {
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).unwrap();
+            let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: code.as_ptr().cast(),
+                    BytecodeLength: code.len(),
+                },
+                ..Default::default()
+            };
+            let pipeline: ID3D12PipelineState = host.device.CreateComputePipelineState(&desc).unwrap();
+            (root, pipeline)
+        };
+        // SAFETY: the initialized dwords fit in the mapped input buffer.
+        unsafe {
+            source.add(64).cast::<u32>().write(0x1234);
+            source.add(64 + 1020).cast::<u32>().write(0x5678);
+            source.add(64 + 1024).cast::<u32>().write(0x9abc);
+        }
+        let read_view = || {
+            let list = host.new_list().unwrap();
+            // SAFETY: this list is open and the heap, pipeline, and both
+            // resources remain live until after the submitted work completes.
+            unsafe {
+                destination.cast::<[u32; 3]>().write([u32::MAX; 3]);
+                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetPipelineState(&pipeline);
+                list.list.SetComputeRootDescriptorTable(0, heap.gpu_handle(index));
+                list.list.SetComputeRootUnorderedAccessView(1, result.GetGPUVirtualAddress());
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute_sync_internal(&list);
+            // SAFETY: the submission completed and the mapping holds the result.
+            unsafe { destination.cast::<[u32; 3]>().read_volatile() }
         };
         heap.raw_at(index, &buffer, 64, 1024);
-        let (slot, beside) = (bytes(heap.cpu(index)), bytes(staged(false, 0).unwrap()));
-        assert_eq!(slot, beside, "copied as it was made");
+        assert_eq!(read_view(), [0x1234, 0x5678, 0], "copied as it was made");
         heap.null_raw_at(index);
-        assert_ne!(bytes(heap.cpu(index)), slot, "another view since");
+        assert_eq!(read_view(), [0; 3], "replaced by a null view");
         // SAFETY: a plain query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
@@ -6321,6 +6397,94 @@ mod tests {
         spans.forget(4);
         spans.forget(7);
         assert!(spans.by_start.is_empty() && spans.by_slot.is_empty());
+    }
+
+    #[test]
+    fn pending_texture_changes_survive_a_full_queue() {
+        let count = MAX_PENDING_TEXTURE_CHANGES as u64 + 3;
+        let mut pending = Vec::new();
+        let mut compacted = 0;
+        for i in (0..count).rev() {
+            compacted += remember_texture_change(&mut pending, i * 4, i * 4 + 1);
+        }
+        assert_eq!(compacted, MAX_PENDING_TEXTURE_CHANGES);
+        assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES / 2 + 3);
+
+        join(&mut pending);
+        for i in 0..count {
+            let start = i * 4;
+            let at = pending.partition_point(|&(lo, _)| lo <= start);
+            assert!(at > 0 && pending[at - 1].1 > start, "the change at {start} was lost");
+        }
+    }
+
+    fn assert_texture_changes_covered(pending: &[(u64, u64)], changes: &[(u64, u64)]) {
+        let mut coverage = pending.to_vec();
+        coverage.sort_unstable();
+        let mut furthest = 0;
+        for (_, end) in &mut coverage {
+            furthest = furthest.max(*end);
+            *end = furthest;
+        }
+        for &(start, end) in changes {
+            let at = coverage.partition_point(|&(lo, _)| lo <= start);
+            assert!(
+                at > 0 && coverage[at - 1].1 >= end,
+                "texture change [{start}, {end}) was lost"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_texture_changes_survive_repeated_compactions() {
+        let mut pending = Vec::new();
+        let mut changes = Vec::new();
+        let mut compactions = 0;
+        for batch in 0..4 {
+            for i in 0..MAX_PENDING_TEXTURE_CHANGES {
+                // An odd multiplier permutes each power-of-two-sized batch.
+                let offset = (i * 13_573) & (MAX_PENDING_TEXTURE_CHANGES - 1);
+                let start = ((batch * MAX_PENDING_TEXTURE_CHANGES + offset) as u64) * 8 + 4;
+                changes.push((start, start + 2));
+                compactions +=
+                    usize::from(remember_texture_change(&mut pending, start, start + 2) != 0);
+                assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES);
+            }
+            assert_texture_changes_covered(&pending, &changes);
+        }
+        assert!(
+            compactions > 1,
+            "the test must cross more than one queue compaction"
+        );
+    }
+
+    #[test]
+    fn pending_texture_changes_keep_high_addresses() {
+        let mut pending = Vec::new();
+        let mut changes = vec![(0, 2), (u64::MAX - 1, u64::MAX)];
+        for i in 0..MAX_PENDING_TEXTURE_CHANGES + 31 {
+            let start = u64::MAX - (i as u64) * 8 - 4;
+            changes.push((start, start + 2));
+        }
+        for &(start, end) in &changes {
+            remember_texture_change(&mut pending, start, end);
+            assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES);
+        }
+        assert_texture_changes_covered(&pending, &changes);
+    }
+
+    #[test]
+    fn pending_texture_changes_keep_overlapping_writes() {
+        let mut pending = Vec::new();
+        let mut changes = Vec::new();
+        for i in 0..MAX_PENDING_TEXTURE_CHANGES + 31 {
+            let start = (i as u64 % 4096) * 4;
+            let end = start + if i % 3 == 0 { 100_000 } else { 1 };
+            changes.push((start, end));
+            remember_texture_change(&mut pending, start, end);
+            assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES);
+        }
+        assert_texture_changes_covered(&pending, &changes);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

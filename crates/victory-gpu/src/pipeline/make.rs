@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -193,8 +194,20 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.make_with(|| {
+            let _building = crate::timeline::span("pipeline: build a host pipeline");
+            let began = Instant::now();
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
+            made
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
         // One thread makes it; the others wait for it to be made or lost (a
-        // `get_or_init` behind a thread that died would wait for ever).
+        // `get_or_init` behind a thread that died would wait for ever). A
+        // build that panics is refused; one that kills its thread outright
+        // is the watchdog's.
         if self.made.get().is_none() && !self.lost.load(Ordering::Relaxed) {
             if self.building.swap(true, Ordering::AcqRel) {
                 let (lock, done) = &DONE;
@@ -207,12 +220,12 @@ impl Pending {
                 }
                 return;
             }
-            self.made.get_or_init(|| {
-                let _building = crate::timeline::span("pipeline: build a host pipeline");
-                let began = Instant::now();
-                let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
-                super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
-                made
+            self.made.get_or_init(|| match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(_) => {
+                    tracing::warn!(key = self.key, shaders = ?self.shaders, "host pipeline build panicked");
+                    None
+                }
             });
         }
         let (lock, done) = &DONE;
@@ -766,6 +779,29 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let failed = Arc::new(Pending::new(Vec::new(), None));
+        let next = Arc::new(Pending::new(Vec::new(), None));
+        let failed_job = Arc::clone(&failed);
+        let next_job = Arc::clone(&next);
+        std::thread::spawn(move || {
+            failed_job.make_with(|| panic!("synthetic pipeline build panic"));
+            next_job.make_with(|| None);
+        })
+        .join()
+        .expect("the pipeline worker should survive");
+
+        assert!(matches!(failed.made.get(), Some(None)));
+        assert!(matches!(next.made.get(), Some(None)));
+        let mut rebuilt = false;
+        failed.make_with(|| {
+            rebuilt = true;
+            None
+        });
+        assert!(!rebuilt);
+    }
 
     #[cfg(feature = "diagnostics")]
     #[test]

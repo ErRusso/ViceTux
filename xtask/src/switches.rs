@@ -3,7 +3,8 @@
 //! A switch is read through a string literal of its whole name
 //! (`std::env::var("VICTORY_X")`, `crate::switch::on("VICTORY_X")`,
 //! `crate::ab::pick("VICTORY_X")`), so a name the Markdown files give must
-//! appear quoted in at least one Rust file. xtask's own files are left out
+//! appear quoted in at least one Rust file, or be expanded by a launcher
+//! script (`scripts/*.sh`, `*.ps1`). xtask's own files are left out
 //! of the search: this module's tests name switches of their own.
 
 use std::collections::BTreeSet;
@@ -29,16 +30,39 @@ fn names(text: &str) -> BTreeSet<String> {
     found
 }
 
-/// The names of `documented` that no text of `sources` holds in quotes.
+/// Whether `text` reads switch `name`: in quotes (Rust), or expanded by a
+/// launcher script (`${NAME`, `$NAME`, `$env:NAME`), the whole name only.
+fn reads(text: &str, name: &str) -> bool {
+    if text.contains(&format!("\"{name}\"")) {
+        return true;
+    }
+    ["${", "$", "$env:"].iter().any(|open| {
+        let pattern = format!("{open}{name}");
+        text.match_indices(&pattern).any(|(at, _)| {
+            !text[at + pattern.len()..]
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
+    })
+}
+
+/// The names of `documented` that no text of `sources` reads ([`reads`]).
 fn unread<'a>(documented: &'a BTreeSet<String>, sources: &[String]) -> Vec<&'a str> {
     documented
         .iter()
-        .filter(|name| {
-            let quoted = format!("\"{name}\"");
-            !sources.iter().any(|s| s.contains(&quoted))
-        })
+        .filter(|name| !sources.iter().any(|s| reads(s, name)))
         .map(String::as_str)
         .collect()
+}
+
+#[test]
+fn launchers_read_switches_by_expansion() {
+    assert!(reads(r#"home="${VICTORY_HOME:-$HOME}""#, "VICTORY_HOME"));
+    assert!(reads("cd $VICTORY_HOME/x", "VICTORY_HOME"));
+    assert!(reads("$env:VICTORY_HOME", "VICTORY_HOME"));
+    assert!(!reads("$VICTORY_HOME_DIR", "VICTORY_HOME"));
+    assert!(!reads("# VICTORY_HOME: the cache", "VICTORY_HOME"));
 }
 
 #[test]
@@ -56,7 +80,11 @@ fn documented_switches_are_read() {
     }
     let sources: Vec<String> = files
         .iter()
-        .filter(|p| p.ends_with(".rs") && !p.starts_with("xtask/"))
+        // The launchers read switches too (`VICTORY_HOME` in play-linux.sh).
+        .filter(|p| {
+            (p.ends_with(".rs") && !p.starts_with("xtask/"))
+                || (p.starts_with("scripts/") && (p.ends_with(".sh") || p.ends_with(".ps1")))
+        })
         .filter_map(read)
         .collect();
     assert!(
@@ -77,7 +105,7 @@ fn documented_switches_are_read() {
         .collect();
     assert!(
         dead.is_empty(),
-        "switches the documents name but no Rust source reads: {}",
+        "switches the documents name but no Rust source or launcher reads: {}",
         report.join("; ")
     );
 }
