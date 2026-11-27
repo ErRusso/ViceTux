@@ -6,7 +6,7 @@
 # From a hard disk the title's own streaming (random reads of levels.rpf and
 # the texture tiles of data/ttdb) left textures waiting a mean 23 s for their
 # data; from an NVMe SSD, 3 s. The whole dump is about 225 GB; this copies
-# about 108 GB and links everything else, so the folder works as the dump:
+# about 125 GB and links everything else, so the folder works as the dump:
 # point VICTORY_GAME_DIR (or $VICTORY_HOME/game-dir) at it.
 #
 # On btrfs the folder is made a subvolume of its own: snapshots of the
@@ -21,7 +21,10 @@ dst="${2:?usage: fast-copy.sh <dump> <ssd folder>}"
 src="$(cd "$src" && pwd)"
 [[ -f "$src/game_scarlett_master.exe" ]] || { echo "$src does not look like the dump (no game_scarlett_master.exe)." >&2; exit 1; }
 
-COPY="${COPY:-levels.rpf data/ttdb/terrain data/ttdb/peds data/ttdb/props data/ttdb/ui data/ttdb/vfx data/ttdb/lighting data/ttdb/graphics}"
+# data/ttdb/maps (14 GB) holds the map's texture tiles, three quarters of all
+# streaming reads in the world: left on a hard disk they came at about 100 a
+# second and textures stayed missing.
+COPY="${COPY:-levels.rpf data/ttdb/maps data/ttdb/interiors data/ttdb/terrain data/ttdb/peds data/ttdb/props data/ttdb/ui data/ttdb/vfx data/ttdb/lighting data/ttdb/graphics}"
 
 need=0
 for rel in $COPY; do need=$((need + $(du -sb "$src/$rel" | cut -f1))); done

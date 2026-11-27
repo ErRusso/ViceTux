@@ -159,11 +159,12 @@ fi
 # streaming reads at most a few of them at once (VICTORY_DSTORAGE_SLOW_MAX),
 # so the reads from the SSD do not wait behind a seeking disk's.
 slow=()
-for entry in "$game_dir"/* "$game_dir"/pack/*; do
-    [[ -L $entry ]] || continue
+# Links at any depth: fast-copy.sh links folders inside data/ttdb too (the
+# map texture tiles, read most of all, were missed one level down).
+while IFS= read -r -d '' entry; do
     dev="$(findmnt -no SOURCE --target "$(readlink -f "$entry")" 2>/dev/null | sed 's/\[.*//')"
     [[ -n $dev && "$(lsblk -ndo ROTA "$dev" 2>/dev/null | tr -d ' ')" == 1 ]] && slow+=("${entry#"$game_dir"/}")
-done
+done < <(find "$game_dir" -type l -print0)
 if ((${#slow[@]})); then export VICTORY_DSTORAGE_SLOW="$(IFS=,; echo "${slow[*]}")"; fi
 # --dlss: NVIDIA DLSS upscales the Series S render (nvngx_dlss.dll in
 # $DLSS_DIR; Proton's NVAPI on), with AMD FSR from $FFX_DIR standing by.
