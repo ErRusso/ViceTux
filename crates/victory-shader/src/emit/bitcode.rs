@@ -1229,7 +1229,7 @@ mod tests {
 
         m.single_latches();
         let into_head: Vec<usize> = (0..m.blocks.len())
-            .filter(|&k| successors(m.blocks[k].term).iter().any(|&s| s == head))
+            .filter(|&k| successors(m.blocks[k].term).contains(&head))
             .collect();
         assert_eq!(into_head.len(), 2, "the entry and one latch: {into_head:?}");
         let latch = *into_head.iter().find(|&&k| k != entry).unwrap();

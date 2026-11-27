@@ -3261,6 +3261,13 @@ fn forget_uncommitted(first: usize, last: usize) {
     }
 }
 
+/// What the 8-frame turn of [`uncommitted_end`] does: every remembered
+/// uncommitted region is asked again.
+#[cfg(test)]
+fn uncommitted_epoch_passes() {
+    UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner()).0.clear();
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
     if !absent_cache() {
@@ -4748,6 +4755,9 @@ mod tests {
             // SAFETY: each address is inside its committed read-write page.
             unsafe { (at as *mut u8).write_volatile(1) };
         }
+        // Nothing told us of that commit: the remembered uncommitted region
+        // stands until the next 8-frame turn asks again.
+        uncommitted_epoch_passes();
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
     }
 
