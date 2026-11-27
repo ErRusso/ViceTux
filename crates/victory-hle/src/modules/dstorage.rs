@@ -787,6 +787,26 @@ pub(crate) mod stream_log {
             std::thread::spawn(|| {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
+                    let w: [u64; 6] = std::array::from_fn(|i| super::PAGE_WRITES[i].swap(0, Ordering::Relaxed));
+                    if w[0] + w[1] > 0 {
+                        line(format_args!(
+                            "W\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                            now(),
+                            w[0],
+                            w[1],
+                            w[2] / 1_000_000,
+                            w[3] / 1_000_000,
+                            w[4] / 1_000_000,
+                            w[5] / 1_000_000
+                        ));
+                    }
+                    let pp: [u64; 4] = std::array::from_fn(|i| super::PAGE_PATH[i].swap(0, Ordering::Relaxed));
+                    if pp[3] > 0 {
+                        line(format_args!("T\t{}\t{}\t{}\t{}\t{}", now(), pp[3], pp[0] / 1_000_000, pp[1] / 1_000_000, pp[2] / 1_000_000));
+                    }
+                    if let Some([calls, runs, find, tell]) = super::super::xmem::notice_costs() {
+                        line(format_args!("N\t{}\t{calls}\t{runs}\t{find}\t{tell}", now()));
+                    }
                     if let Some(costs) = super::super::xmem::map_costs() {
                         line(format_args!("M\t{}\t{costs}", now()));
                     }
@@ -1493,7 +1513,11 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
+    let read_started = std::time::Instant::now();
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    if stream_log::on() && request.options & PAGE_DESTINATION != 0 {
+        PAGE_PATH[0].fetch_add(read_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1704,15 +1728,25 @@ fn into_destination(
     }
     let offset = (request.page_offset & 0xffff) as usize;
     let list = request.destination.cast();
+    let listed = std::time::Instant::now();
     let mut pages = page_list(list, offset, len);
+    if stream_log::on() {
+        PAGE_PATH[1].fetch_add(listed.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
     // The title sees its destination through the pages its list names: if
     // it names others by the time the data is written, they get it as well.
     // (Said aloud: by the title's protocol a submitted request's list stays
     // as it is.)
     for _ in 0..3 {
         into_pages(&pages, offset, len, &mut fill)?;
+        let checked = std::time::Instant::now();
         let now = read_list(list, offset, len);
-        if now == pages || !super::xmem::pages_known(&now, offset, len) {
+        let same = now == pages || !super::xmem::pages_known(&now, offset, len);
+        if stream_log::on() {
+            PAGE_PATH[2].fetch_add(checked.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            PAGE_PATH[3].fetch_add(1, Ordering::Relaxed);
+        }
+        if same {
             break;
         }
         tracing::warn!(
@@ -1728,6 +1762,15 @@ fn into_destination(
     Ok(())
 }
 
+/// For the streaming log's `W` lines: page-destination writes through a
+/// kept view and through a fresh one, then nanoseconds opening the window,
+/// filling it, dropping it (unmapping a fresh one) and telling the GPU side.
+static PAGE_WRITES: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// For the streaming log's `T` lines: nanoseconds reading page requests'
+/// sources, reading their page lists, checking the lists after the write,
+/// and those checks.
+static PAGE_PATH: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Runs `fill` on `len` bytes of `pages`, from `offset` into the first.
 fn into_pages(
     pages: &[usize],
@@ -1737,9 +1780,24 @@ fn into_pages(
 ) -> Result<(), HRESULT> {
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
+    let t0 = std::time::Instant::now();
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
+        let own = window.is_own();
+        let t1 = std::time::Instant::now();
         let filled = fill(window.bytes()).map(drop);
+        let t2 = std::time::Instant::now();
+        drop(window);
+        let t3 = std::time::Instant::now();
         super::xmem::pages_written(pages, offset, len);
+        if stream_log::on() {
+            let ns = |a: std::time::Instant, b: std::time::Instant| (b - a).as_nanos() as u64;
+            let w = &PAGE_WRITES;
+            w[usize::from(own)].fetch_add(1, Ordering::Relaxed);
+            w[2].fetch_add(ns(t0, t1), Ordering::Relaxed);
+            w[3].fetch_add(ns(t1, t2), Ordering::Relaxed);
+            w[4].fetch_add(ns(t2, t3), Ordering::Relaxed);
+            w[5].fetch_add(ns(t3, std::time::Instant::now()), Ordering::Relaxed);
+        }
         return filled;
     }
     let mut data = vec![0; len];

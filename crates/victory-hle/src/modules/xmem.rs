@@ -494,8 +494,35 @@ unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+/// Physical memory accounting, in 64 KiB pages: sections alive (all their
+/// pages), pages the title holds now, and allocations and frees so far.
+static PHYS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Every 10 s at most: what the title holds against what its sections keep.
+fn phys_report() {
+    use std::sync::atomic::AtomicU64;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last + 10 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let mb = |i: usize| (PHYS[i].load(Ordering::Relaxed) * PAGE as u64) >> 20;
+    tracing::info!(
+        sections_mb = mb(0),
+        held_mb = mb(1),
+        freed_in_live_sections_mb = mb(0).saturating_sub(mb(1)),
+        allocated_mb = mb(2),
+        freed_mb = mb(3),
+        "physical pages: the title holds {} MB in sections of {} MB",
+        mb(1),
+        mb(0)
+    );
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
+        PHYS[0].fetch_sub(self.pages as u64, Ordering::Relaxed);
         use windows_sys::Win32::System::Memory::UnmapViewOfFile;
         if let Some(&base) = self.window.get()
             && base != 0
@@ -697,6 +724,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    PHYS[0].fetch_add(n as u64, Ordering::Relaxed);
+    PHYS[1].fetch_add(n as u64, Ordering::Relaxed);
+    PHYS[2].fetch_add(n as u64, Ordering::Relaxed);
+    phys_report();
     let section = Arc::new(Section {
         handle,
         pages: n,
@@ -739,7 +770,10 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     // Dropped without the lock: the last page of a section unmaps its window.
     let gone: Vec<Slice> = numbers.iter().filter_map(|number| table.pages.remove(number)).collect();
     drop(table);
+    PHYS[1].fetch_sub(gone.len() as u64, Ordering::Relaxed);
+    PHYS[3].fetch_add(gone.len() as u64, Ordering::Relaxed);
     drop(gone);
+    phys_report();
     1
 }
 
@@ -886,6 +920,11 @@ enum Window {
 }
 
 impl PageWindow {
+    /// Whether this is a fresh view of our own (mapped now, unmapped on drop).
+    pub(crate) fn is_own(&self) -> bool {
+        matches!(self.view, Window::Own(_))
+    }
+
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
         match &mut self.view {
@@ -971,13 +1010,31 @@ pub(crate) fn pages_written(pages: &[usize], offset: usize, len: usize) {
     if len == 0 {
         return;
     }
-    for (at, bytes) in shown_at(pages, offset, len) {
+    let started = std::time::Instant::now();
+    let runs = shown_at(pages, offset, len);
+    let found = std::time::Instant::now();
+    for &(at, bytes) in &runs {
         if stream_notice() {
             victory_gpu::kernel_will_write(at, bytes);
         } else {
             victory_gpu::title_memory_written(at, bytes, true);
         }
     }
+    // For the streaming log's `N` line: calls, runs told, ns finding where
+    // the title sees the bytes, ns telling the GPU side.
+    NOTICE[0].fetch_add(1, Ordering::Relaxed);
+    NOTICE[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+    NOTICE[2].fetch_add((found - started).as_nanos() as u64, Ordering::Relaxed);
+    NOTICE[3].fetch_add(found.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+/// [`pages_written`]'s costs since the last asking ([`notice_costs`]).
+static NOTICE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Calls, runs, ms finding, ms telling, for the streaming log's `N` line.
+pub(crate) fn notice_costs() -> Option<[u64; 4]> {
+    let n: [u64; 4] = std::array::from_fn(|i| NOTICE[i].swap(0, Ordering::Relaxed));
+    (n[0] > 0).then(|| [n[0], n[1], n[2] / 1_000_000, n[3] / 1_000_000])
 }
 
 /// What the title's mapping calls cost since the last asking, for the
