@@ -132,6 +132,8 @@ while pipelines are made; they are kept for the next runs.
 | `--raytracing` | The title's own ray-traced light: correct indoor lighting, about half the frame rate |
 | `--rt-shadows` | With `--raytracing`: the ray-traced shadows too (slower still) |
 | `--rt-low` | The title's ray-traced bounced light, updated every second frame, reflections without rays: for 8 GB cards |
+| `--dlss quality\|balanced\|performance` | NVIDIA DLSS upscales the Series S render (`nvngx_dlss.dll` in `$DLSS_DIR`, default `~/.local/share/vice-tay/dlss`) |
+| `--framegen` | AMD frame generation: twice the frames shown (FidelityFX SDK 2.4 signed DLLs in `$FFX_DIR`) |
 | `--machine 4060\|4070\|4090\|7900xtx` | Force a profile (default: picked from your card) |
 | `--console series-x` | Run as a Series X (heavier) |
 | `--safe` | Leave out the settings still on trial |

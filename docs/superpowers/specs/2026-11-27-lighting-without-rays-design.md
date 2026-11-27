@@ -67,3 +67,48 @@ The stand-in runs (its resolve role reports each time), yet even a strong
 constant light barely moves that ground: what lights it in the ray-traced
 image is not the buffer the stand-in writes (most likely the title's probes
 or irradiance cache). Next: approach 2.
+
+## Approach 2, chosen: rays for the bounced light, every second frame
+
+Owner's choice: rays for the bounced light only, and the ray-traced light
+updated every second frame. Goal unchanged: 15 fps steady, light the owner
+does not notice as wrong. Expected 12-15 fps; to be measured.
+
+- **Rays on** as `--raytracing` does now (`VICTORY_BVH_BUILDER=1`), shadow
+  traces still out (`VICTORY_RT_SHADOWS=0`).
+- **Reflection traces left out**, like the shadow traces (by program name in
+  `pipeline/make.rs` `left_out`); reflections from upstream's hold
+  (`VICTORY_AMBIENT_REFLECT`). The exact names come from the title's
+  containers (logged once by name in a diagnostics run).
+- **Every second frame** a new switch skips the bounced light's ray chain at
+  dispatch: the per-frame clears of ray counts and bins, the traces
+  (`CS_ScreenProbes_TraceRays_*`, the irradiance cache's), and the hit
+  shading (`CS_RaytracingResolve_*`). Kept every frame: the structure
+  builder (skipping its refits would leave moved objects in old places and
+  meets the structures' overlap bug), the temporal resolves, upscales and
+  final gathers, which then work from the last frame's rays.
+- A launcher option `--rt-low` sets all of the above.
+- Check: the same comparison as before (saved frames, ground/sky luma)
+  against full `--raytracing`, the frame rate from the log, and no light
+  flickering frame to frame (luma of consecutive saved frames).
+
+Risk: if skipping the chain leaves something the next pass reads empty, the
+light flickers dark every other frame; then the cut moves (fewer passes
+skipped) or the rate idea is dropped and 2 runs every frame.
+
+## Result of approach 2 (`--rt-low`, 2026-11-27)
+
+RTX 4060 8 GB, Proton, world frames only (500+ draws), diagnostics build:
+
+| Run | World fps median | p10 |
+|---|---|---|
+| `--raytracing` | 3.4 | 2.5 |
+| `--rt-low` | 14.9 | 3.5 |
+| no rays (stand-in) | 24.7 | 22.8 |
+
+- No flicker: ten consecutive frames in the prison yard, odd-frame mean luma
+  94.14 against even 94.08; the light rises smoothly (93.7 to 94.6).
+- The yard at sunset is lit like the ray-traced runs: shade filled, no black
+  ground. The low p10 is loading stalls, not the rays.
+- Reflections: no glass or water in the frames looked at; the reflection
+  traces stay left out until a scene with them shows otherwise.

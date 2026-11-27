@@ -4,7 +4,7 @@
 #   cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 #
 #   scripts/play-linux.sh [--machine 4060|4070|4090] [--console series-s|series-x]
-#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows] | --rt-low] [--breadcrumbs] [--cmd run|shaders|warm]
+#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows] | --rt-low] [--dlss quality|balanced|performance] [--framegen] [--breadcrumbs] [--cmd run|shaders|warm]
 #                         [KEY=VALUE ...]   extra VICTORY_* overrides
 #
 # Paths come from the environment (defaults in brackets):
@@ -46,7 +46,7 @@ fi
 build="${VICTORY_BUILD:-diag}"
 victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
 
-machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 rt_shadows=0 rt_low=0 crumbs=0 cmd=run
+machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 rt_shadows=0 rt_low=0 dlss= framegen=0 crumbs=0 cmd=run
 extra=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -58,6 +58,8 @@ while [[ $# -gt 0 ]]; do
         --raytracing) rt=1; shift ;;
         --rt-shadows) rt_shadows=1; shift ;;
         --rt-low) rt=1; rt_low=1; shift ;;
+        --dlss) dlss="$2"; shift 2 ;;
+        --framegen) framegen=1; shift ;;
         --breadcrumbs) crumbs=1; shift ;;
         --cmd) cmd="$2"; shift 2 ;;
         VICTORY_*=*) extra+=("$1"); shift ;;
@@ -163,6 +165,22 @@ for entry in "$game_dir"/* "$game_dir"/pack/*; do
     [[ -n $dev && "$(lsblk -ndo ROTA "$dev" 2>/dev/null | tr -d ' ')" == 1 ]] && slow+=("${entry#"$game_dir"/}")
 done
 if ((${#slow[@]})); then export VICTORY_DSTORAGE_SLOW="$(IFS=,; echo "${slow[*]}")"; fi
+# --dlss: NVIDIA DLSS upscales the Series S render (nvngx_dlss.dll in
+# $DLSS_DIR; Proton's NVAPI on), with AMD FSR from $FFX_DIR standing by.
+# --framegen: AMD frame generation (FidelityFX SDK 2.4's signed
+# amd_fidelityfx_framegeneration_dx12.dll and loader in $FFX_DIR): twice the
+# frames shown, not rendered.
+ffx_dir="${FFX_DIR:-$HOME/.local/share/FidelityFX-SDK/signedbin-2.4}"
+if [[ -n $dlss ]]; then
+    dlss_dir="${DLSS_DIR:-$home/dlss}"
+    [[ -f "$dlss_dir/nvngx_dlss.dll" ]] || { echo "--dlss: no nvngx_dlss.dll in $dlss_dir (set DLSS_DIR)." >&2; exit 1; }
+    export VICTORY_DLSS="$dlss" VICTORY_DLSS_DIR="$(winpath "$dlss_dir")" PROTON_ENABLE_NVAPI=1
+    [[ -f "$ffx_dir/amd_fidelityfx_upscaler_dx12.dll" ]] && export VICTORY_FIDELITYFX_DIR="$(winpath "$ffx_dir")"
+fi
+if [[ $framegen == 1 ]]; then
+    [[ -f "$ffx_dir/amd_fidelityfx_framegeneration_dx12.dll" ]] || { echo "--framegen: no amd_fidelityfx_framegeneration_dx12.dll in $ffx_dir (set FFX_DIR)." >&2; exit 1; }
+    export VICTORY_FRAMEGEN=1 VICTORY_FFX_FG_DIR="$(winpath "$ffx_dir")"
+fi
 [[ $windowed == 0 ]] && export VICTORY_FULLSCREEN=1
 [[ $panel == 1 ]] && export VICTORY_PANEL=1
 # Every run keeps the layer's log (a build for the windows subsystem has no
