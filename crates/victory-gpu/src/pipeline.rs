@@ -326,23 +326,43 @@ fn alternate_named(container: &[u8]) -> bool {
     ALTERNATE.iter().any(|name| container.windows(name.len()).any(|w| w == *name))
 }
 
-/// The frames the ray chain is left for the next: the odd ones.
+/// The frames the ray chain is left for the next: all but one in `period`.
 #[cfg(windows)]
-fn alternate_frame(frame: u64) -> bool {
-    frame % 2 == 1
+fn alternate_frame(frame: u64, period: u64) -> bool {
+    !frame.is_multiple_of(period)
 }
 
-/// `VICTORY_RT_LOW=1`: the ray chain every second frame (`--rt-low`).
+/// `VICTORY_RT_LOW=<n>`: the ray chain once every `n` frames (`1`, as
+/// `--rt-low` sets it, is every second; unset or `0`: every frame). On an
+/// 8 GB card the rays' structures leave the card's memory full and about
+/// 6 GB of what it reads in the PC's, over the bus.
+#[cfg(windows)]
+fn rt_low_period(value: Option<&str>) -> Option<u64> {
+    match value?.trim().parse::<u64>().ok()? {
+        0 => None,
+        1 => Some(2),
+        n => Some(n),
+    }
+}
+
+#[cfg(windows)]
+fn rt_low_every() -> Option<u64> {
+    static PERIOD: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| rt_low_period(std::env::var("VICTORY_RT_LOW").ok().as_deref()))
+}
+
+/// Whether `VICTORY_RT_LOW` runs the ray chain less than every frame.
 #[cfg(windows)]
 pub(crate) fn rt_low() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RT_LOW").is_some_and(|v| v == "1"))
+    rt_low_every().is_some()
 }
 
 /// Whether a dispatch of pipeline `this` is left for the next frame.
 #[cfg(windows)]
 pub(crate) fn skips_this_frame(this: This) -> bool {
-    !this.is_null() && pipeline(this).alternate && alternate_frame(crate::frame::current())
+    !this.is_null()
+        && pipeline(this).alternate
+        && rt_low_every().is_some_and(|period| alternate_frame(crate::frame::current(), period))
 }
 
 /// `VICTORY_BVH_QUARANTINE=1`: what the structure builder's stages store
@@ -995,9 +1015,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn the_chain_runs_on_even_frames() {
-        assert!(!super::alternate_frame(0));
-        assert!(super::alternate_frame(1));
-        assert!(!super::alternate_frame(8192));
+        assert!(!super::alternate_frame(0, 2));
+        assert!(super::alternate_frame(1, 2));
+        assert!(!super::alternate_frame(8192, 2));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_chain_runs_once_a_period() {
+        let ran: Vec<u64> = (0..9).filter(|&f| !super::alternate_frame(f, 3)).collect();
+        assert_eq!(ran, [0, 3, 6]);
+        // "1" (as `--rt-low` sets it) means every second frame.
+        assert_eq!(super::rt_low_period(Some("1")), Some(2));
+        assert_eq!(super::rt_low_period(Some("3")), Some(3));
+        assert_eq!(super::rt_low_period(Some("0")), None);
+        assert_eq!(super::rt_low_period(None), None);
+        assert_eq!(super::rt_low_period(Some("x")), None);
     }
 
     #[cfg(all(windows, feature = "diagnostics"))]

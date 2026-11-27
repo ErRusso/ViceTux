@@ -1295,6 +1295,9 @@ const BATCHES: u32 = 8;
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
+    /// The number of the last submission that ran this list
+    /// ([`submissions`]); a reset before it finished is reported.
+    submitted_in: std::sync::atomic::AtomicU64,
     /// With barriers held and joined (`rec`).
     pub(crate) list: rec::Rec,
     /// Whether the underlying D3D12 list has been closed since its last reset.
@@ -4941,6 +4944,7 @@ impl Host {
             }
             Ok(HostList {
                 allocator,
+                submitted_in: std::sync::atomic::AtomicU64::new(0),
                 list: rec::Rec::new(list),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 deferred: Mutex::default(),
@@ -6440,6 +6444,9 @@ impl Host {
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        for list in runs {
+            list.submitted_in.store(this_submission, Ordering::Relaxed);
+        }
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
@@ -7254,6 +7261,22 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
+        // Its scratch chunks and kept objects go back now: a submission of
+        // it the card has not finished would read them after their reuse.
+        let last = self.submitted_in.load(Ordering::Relaxed);
+        let finished = FINISHED.load(Ordering::Acquire);
+        if last > finished {
+            static EARLY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = EARLY.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::warn!(
+                    early_resets = n,
+                    submission = last,
+                    finished,
+                    "a host list reset before its last submission finished (scratch and kept objects reused while the card may read them)"
+                );
+            }
+        }
         self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
