@@ -2184,6 +2184,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    forget_uncommitted(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     if len == 0 || !known_holes() {
         return;
     }
@@ -3225,8 +3226,71 @@ fn protect_here(g: &Guards, from: usize, to: usize) {
     }
 }
 
+/// Uncommitted regions found by [`uncommitted_end`] (start and end block),
+/// and the stretch of frames they were found in. Every asking looked the
+/// absent blocks of each region up again: 75,000-216,000 `VirtualQuery` a
+/// second from here under Proton (kroeeee-eeee/VIctory-Linux-Proton-Wine,
+/// f5c30ef), each under Wine's process-wide lock that every thread of ours
+/// queued at. Regions become memory through the runtime
+/// (`title_memory_remapped`) or `XMemVirtualAlloc` (`title_memory_allocated`),
+/// which drop what they cover; every 8 frames everything is asked again, for
+/// any other way. `VICTORY_ABSENT_CACHE=0`: asked every time.
+static UNCOMMITTED: Mutex<(BTreeMap<usize, usize>, u64)> = Mutex::new((BTreeMap::new(), u64::MAX));
+
+fn absent_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ABSENT_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Drops the remembered uncommitted regions that touch blocks `[first, last)`.
+fn forget_uncommitted(first: usize, last: usize) {
+    let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.0.is_empty() {
+        return;
+    }
+    let gone: Vec<usize> = cache
+        .0
+        .range(..last)
+        .rev()
+        .take_while(|&(_, &end)| end > first)
+        .map(|(&start, _)| start)
+        .chain(cache.0.range(first..last).map(|(&s, _)| s))
+        .collect();
+    for start in gone {
+        cache.0.remove(&start);
+    }
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    if !absent_cache() {
+        return uncommitted_end_asked(block);
+    }
+    let epoch = crate::queue::presented() / 8;
+    {
+        let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.1 != epoch {
+            cache.0.clear();
+            cache.1 = epoch;
+        }
+        if let Some((_, &end)) = cache.0.range(..=block).next_back()
+            && block < end
+        {
+            return end;
+        }
+    }
+    let end = uncommitted_end_asked(block);
+    if end > block {
+        let mut cache = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.1 == epoch && cache.0.len() < 1 << 18 {
+            cache.0.insert(block, end);
+        }
+    }
+    end
+}
+
+/// [`uncommitted_end`] as the system answers it.
+fn uncommitted_end_asked(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -3737,6 +3801,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// neither guarded nor writable) and a kernel read into it fail, so the
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    forget_uncommitted(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }

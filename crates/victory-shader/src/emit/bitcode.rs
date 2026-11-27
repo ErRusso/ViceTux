@@ -500,6 +500,87 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Gives every loop header one back edge: where several blocks branch
+    /// back to a header (an edge to a block not after them in reverse
+    /// postorder), they branch to a new latch instead, which branches to
+    /// the header; the header's phis take those blocks' values through
+    /// phis of the latch. DXC's loops always have one latch, and
+    /// dxil-spirv (vkd3d-proton, so every Proton run) asserts on a header
+    /// with two back edges, and without asserts recursed without end in
+    /// its dominator search (the compile's thread died in the stack
+    /// overflow; three of the title's compute programs, faces missing).
+    pub fn single_latches(&mut self) {
+        let n = self.blocks.len();
+        if n == 0 {
+            return;
+        }
+        let succs = |m: &Self, b: usize| successors(m.blocks[b].term);
+        // Reverse postorder from the entry, as `write` lays blocks out.
+        let mut seen = vec![false; n];
+        let mut post = Vec::new();
+        let mut stack = vec![(0usize, 0usize)];
+        seen[0] = true;
+        while let Some(top) = stack.last_mut() {
+            let (b, k) = *top;
+            top.1 += 1;
+            match succs(self, b).get(k) {
+                Some(&s) if !seen[s] => {
+                    seen[s] = true;
+                    stack.push((s, 0));
+                }
+                Some(_) => {}
+                None => {
+                    post.push(b);
+                    stack.pop();
+                }
+            }
+        }
+        post.reverse();
+        let mut pos = vec![usize::MAX; n];
+        for (i, &b) in post.iter().enumerate() {
+            pos[b] = i;
+        }
+        // Each header's back-edge sources, in layout order.
+        let mut back: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+        for &b in &post {
+            for &s in succs(self, b).iter() {
+                if pos[s] <= pos[b] && !back.get(&s).is_some_and(|v| v.contains(&b)) {
+                    back.entry(s).or_default().push(b);
+                }
+            }
+        }
+        for (header, sources) in back {
+            if sources.len() < 2 {
+                continue;
+            }
+            let latch = self.new_block();
+            for &src in &sources {
+                let swap = |t: usize| if t == header { latch } else { t };
+                self.blocks[src].term = match self.blocks[src].term {
+                    Some(Term::Br(t)) => Some(Term::Br(swap(t))),
+                    Some(Term::CondBr(c, t, f)) => Some(Term::CondBr(c, swap(t), swap(f))),
+                    other => other,
+                };
+            }
+            for phi in self.blocks[header].phis.clone() {
+                let ty = self.insts[phi as usize].ty;
+                let Op::Phi(incoming) = self.insts[phi as usize].op.clone() else {
+                    continue;
+                };
+                let (from_back, mut kept): (Vec<_>, Vec<_>) =
+                    incoming.into_iter().partition(|&(_, b)| sources.contains(&b));
+                if from_back.is_empty() {
+                    continue;
+                }
+                let joined = self.phi(latch, ty);
+                self.set_phi(joined, from_back);
+                kept.push((joined, latch));
+                self.insts[phi as usize].op = Op::Phi(kept);
+            }
+            self.blocks[latch].term = Some(Term::Br(header));
+        }
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -1119,6 +1200,53 @@ mod tests {
         let _ = m.call(exit, f, vec![acc, cur[0]]);
         m.terminate(exit, Term::Ret);
         m
+    }
+
+    /// A header with two back edges gets one latch that both branch to, its
+    /// phi taking their values through the latch's.
+    #[test]
+    fn single_latches_join_two_back_edges() {
+        let mut m = Module::default();
+        let i32t = m.int(32);
+        let void = m.void();
+        let main_ty = m.func_ty(void, vec![]);
+        m.function("main", main_ty, None, true);
+        let (entry, head, body, back2, exit) =
+            (m.new_block(), m.new_block(), m.new_block(), m.new_block(), m.new_block());
+        let (zero, one, two) = (m.i32(0), m.i32(1), m.i32(2));
+        m.terminate(entry, Term::Br(head));
+        let p = m.phi(head, i32t);
+        m.terminate(head, Term::Br(body));
+        let a = m.bin(body, Bin::Add, p, one);
+        let c = m.cmp(body, pred::IULT, a, two);
+        // Back to the header from the body, and from a second block.
+        m.terminate(body, Term::CondBr(c, head, back2));
+        let b = m.bin(back2, Bin::Add, a, one);
+        let d = m.cmp(back2, pred::IULT, b, two);
+        m.terminate(back2, Term::CondBr(d, head, exit));
+        m.terminate(exit, Term::Ret);
+        m.set_phi(p, vec![(zero, entry), (a, body), (b, back2)]);
+
+        m.single_latches();
+        let into_head: Vec<usize> = (0..m.blocks.len())
+            .filter(|&k| successors(m.blocks[k].term).iter().any(|&s| s == head))
+            .collect();
+        assert_eq!(into_head.len(), 2, "the entry and one latch: {into_head:?}");
+        let latch = *into_head.iter().find(|&&k| k != entry).unwrap();
+        assert!(matches!(m.blocks[body].term, Some(Term::CondBr(_, t, _)) if t == latch));
+        assert!(matches!(m.blocks[back2].term, Some(Term::CondBr(_, t, _)) if t == latch));
+        let V::Inst(pi) = p else { panic!() };
+        let Op::Phi(incoming) = &m.insts[pi as usize].op else { panic!() };
+        assert_eq!(incoming.len(), 2);
+        assert!(incoming.iter().any(|&(_, from)| from == entry));
+        let &(joined, _) = incoming.iter().find(|&&(_, from)| from == latch).unwrap();
+        let V::Inst(ji) = joined else { panic!() };
+        assert!(matches!(&m.insts[ji as usize].op, Op::Phi(v) if v.len() == 2));
+        let _ = m.write();
+        // A loop of one back edge is left as it is.
+        let blocks = m.blocks.len();
+        m.single_latches();
+        assert_eq!(m.blocks.len(), blocks);
     }
 
     /// FNV-1a, to pin a written module's exact bytes.
