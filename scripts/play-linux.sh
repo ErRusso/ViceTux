@@ -143,6 +143,8 @@ if [[ $rt == 1 ]]; then
     [[ $rt_shadows == 1 ]] || export VICTORY_RT_SHADOWS=0
 else
     export VICTORY_AMBIENT=1.0 VICTORY_AMBIENT_SETTLE=4000,0 VICTORY_AMBIENT_AIR=2
+    # The least bounced light anywhere: rooms kept some light with their lamps off screen.
+    export VICTORY_AMBIENT_FLOOR="${AMBIENT_FLOOR:-0.1}"
 fi
 [[ $windowed == 0 ]] && export VICTORY_FULLSCREEN=1
 [[ $panel == 1 ]] && export VICTORY_PANEL=1
