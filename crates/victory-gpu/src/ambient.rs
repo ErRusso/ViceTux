@@ -95,7 +95,12 @@ fn role_in(container: &[u8], reflect_in: &[String]) -> Option<Role> {
 /// and reads the scene's depth, and where the other writes the light of
 /// visible surfaces: root parameter and place in its table, in dwords.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
-pub(crate) const DEPTH: (u8, u32) = (0, 464);
+/// The places the resolve reads the depth texture, first the depth plane
+/// (R32_FLOAT_X8X24_TYPELESS, plane 0). At 464 it reads the same texture's
+/// stencil (X32_TYPELESS_G8X24_UINT, plane 1): taken for depth before, and
+/// refused since the resolve takes only a depth plane (fa8fc1d), which
+/// left the stand-in off and rooms without their bounced light.
+pub(crate) const DEPTH: [(u8, u32); 2] = [(0, 688), (0, 464)];
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);

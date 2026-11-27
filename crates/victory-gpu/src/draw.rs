@@ -3406,7 +3406,7 @@ impl State {
             return false;
         };
         let depth = if role == Role::Resolve {
-            let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
+            let Some((seen, depth)) = DEPTH.iter().find_map(|&at| entry(ResourceType::Srv, at)) else {
                 once!(?role, "no stand-in for the indirect light: missing depth SRV");
                 return false;
             };
