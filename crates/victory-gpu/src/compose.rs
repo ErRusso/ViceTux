@@ -107,73 +107,12 @@ unsafe impl Send for Composer {}
 // SAFETY: as above.
 unsafe impl Sync for Composer {}
 
-/// One table of the two planes' views (t0, t1) for the pixel stage, the
-/// plane's mode (b0), and a linear clamping sampler at s0.
-fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
-    let range = D3D12_DESCRIPTOR_RANGE {
-        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
-        NumDescriptors: 2,
-        BaseShaderRegister: 0,
-        RegisterSpace: 0,
-        OffsetInDescriptorsFromTableStart: 0,
-    };
-    let parameters = [
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                    NumDescriptorRanges: 1,
-                    pDescriptorRanges: &range,
-                },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-        },
-        // The plane's mode at b0.
-        D3D12_ROOT_PARAMETER {
-            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
-            Anonymous: D3D12_ROOT_PARAMETER_0 {
-                Constants: D3D12_ROOT_CONSTANTS { ShaderRegister: 0, RegisterSpace: 0, Num32BitValues: 1 },
-            },
-            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-        },
-    ];
-    let sampler = D3D12_STATIC_SAMPLER_DESC {
-        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
-        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-        MaxAnisotropy: 16,
-        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
-        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
-        MaxLOD: f32::MAX,
-        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
-        ..Default::default()
-    };
-    let desc = D3D12_ROOT_SIGNATURE_DESC {
-        NumParameters: parameters.len() as u32,
-        pParameters: parameters.as_ptr(),
-        NumStaticSamplers: 1,
-        pStaticSamplers: &sampler,
-        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
-    };
-    let mut blob: Option<ID3DBlob> = None;
-    // SAFETY: the description and what it points to live through the calls;
-    // the blob's bytes through `CreateRootSignature`.
-    unsafe {
-        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
-        let blob = blob.ok_or_else(windows::core::Error::empty)?;
-        device.CreateRootSignature(
-            0,
-            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
-        )
-    }
-}
 
 fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
-    let mut code: Option<ID3DBlob> = None;
-    // SAFETY: the source and names live through the call; the out pointer is
+    let (mut code, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: the source and names live through the call; the out pointers are
     // ours.
-    unsafe {
+    let compiled = unsafe {
         D3DCompile(
             SOURCE.as_ptr().cast(),
             SOURCE.len(),
@@ -185,10 +124,97 @@ fn compile(entry: PCSTR, target: PCSTR) -> windows::core::Result<ID3DBlob> {
             0,
             0,
             &mut code,
-            None,
-        )?;
+            Some(&mut errors),
+        )
+    };
+    if let Err(e) = compiled {
+        tracing::warn!(error = %e, log = %blob_text(errors.as_ref()), "display composer shader not compiled");
+        return Err(e);
     }
     code.ok_or_else(windows::core::Error::empty)
+}
+
+fn blob_text(b: Option<&ID3DBlob>) -> String {
+    // SAFETY: the blob's own bytes, alive through the call.
+    b.map(|b| unsafe {
+        String::from_utf8_lossy(std::slice::from_raw_parts(
+            b.GetBufferPointer().cast::<u8>(),
+            b.GetBufferSize(),
+        ))
+        .into_owned()
+    })
+    .unwrap_or_default()
+}
+
+/// The composer's root signature, built here rather than with an HLSL
+/// `[RootSignature]` attribute, which Wine's d3dcompiler does not compile:
+/// t0-t1 in a table and one constant at b0 for the pixel shader, and a linear
+/// clamping sampler at s0.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let range = D3D12_DESCRIPTOR_RANGE {
+        RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+        NumDescriptors: 2,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: 0,
+    };
+    let params = [
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                    NumDescriptorRanges: 1,
+                    pDescriptorRanges: &range,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+        D3D12_ROOT_PARAMETER {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 1,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        },
+    ];
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        MaxAnisotropy: 16,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+        BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+        MaxLOD: f32::MAX,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        ..Default::default()
+    };
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: params.len() as u32,
+        pParameters: params.as_ptr(),
+        NumStaticSamplers: 1,
+        pStaticSamplers: &sampler,
+        Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    };
+    let (mut blob, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
+    // SAFETY: the description and what it points at live through the calls.
+    unsafe {
+        if let Err(e) =
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, Some(&mut errors))
+        {
+            tracing::warn!(error = %e, log = %blob_text(errors.as_ref()), "display composer root signature not made");
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        device.CreateRootSignature(
+            0,
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize()),
+        )
+    }
 }
 
 impl Composer {
