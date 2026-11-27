@@ -133,7 +133,6 @@ while pipelines are made; they are kept for the next runs.
 | `--rt-shadows` | With `--raytracing`: the ray-traced shadows too (slower still) |
 | `--rt-low` | The title's ray-traced bounced light, updated every second frame, reflections without rays: for 8 GB cards |
 | `--dlss quality\|balanced\|performance` | NVIDIA DLSS upscales the Series S render (`nvngx_dlss.dll` in `$DLSS_DIR`, default `~/.local/share/vice-tay/dlss`) |
-| `--framegen` | AMD frame generation: twice the frames shown (FidelityFX SDK 2.4 signed DLLs in `$FFX_DIR`) |
 | `--machine 4060\|4070\|4090\|7900xtx` | Force a profile (default: picked from your card) |
 | `--console series-x` | Run as a Series X (heavier) |
 | `--safe` | Leave out the settings still on trial |
@@ -157,9 +156,13 @@ Every run writes the layer's log to `~/.local/share/vice-tay/logs/`.
   air). `play-linux.sh` now runs stage 1 (`CARD_STEPS=2` brings stage 2
   back): no crash in two 9-minute runs, at 13 fps in gameplay instead of
   16-17. The fault in stage 2 itself is not found yet.
-- **Xwayland keeps memory of every frame shown** (about 120 KB a frame,
-  4 GB an hour; not given back when the game exits, and not from the
-  layer). Restart Xwayland (or log out) between long sessions.
+- **Xwayland grew by about 2 GB a run** in one afternoon's sessions (about
+  120 KB a frame, never given back when the game exited) until the title was
+  killed for memory; later the same day two 8-minute runs and two menu runs
+  left it flat, with and without `VICTORY_PRESENT_INTERVAL=1` (presents
+  with vsync). Not from the layer's own window work. If `Xwayland` grows in
+  `top`, restart it (or log out) between sessions, and try a run with
+  `VICTORY_PRESENT_INTERVAL=1` to see whether it stops.
 - **Frame rate.** 15-16 fps in heavy rooms: about 40 ms a frame preparing the
   GPU's work on the CPU, 15-25 ms copying data back, and the 4060 near full.
 - **Lighting without ray tracing** is an estimate: rooms are lit, but flatter

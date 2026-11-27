@@ -10859,7 +10859,7 @@ impl Host {
                 }
                 status
             } else {
-                p.swap_chain.Present(0, DXGI_PRESENT(0))
+                p.swap_chain.Present(present_interval(), DXGI_PRESENT(0))
             };
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
@@ -12534,4 +12534,16 @@ fn watched_va() -> String {
     #[cfg(feature = "diagnostics")]
     text.push_str(&crate::book::at_loss(va));
     text
+}
+
+/// The sync interval of our presents (`VICTORY_PRESENT_INTERVAL`, 0 unless
+/// set: as soon as the frame is ready). Under Proton on an NVIDIA card,
+/// Xwayland kept about 120 KB of every frame presented with 0, and gave none
+/// of it back when the title exited (about 2 GB a run).
+#[cfg(windows)]
+fn present_interval() -> u32 {
+    static INTERVAL: OnceLock<u32> = OnceLock::new();
+    *INTERVAL.get_or_init(|| {
+        std::env::var("VICTORY_PRESENT_INTERVAL").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n <= 4).unwrap_or(0)
+    })
 }
