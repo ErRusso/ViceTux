@@ -4,7 +4,7 @@
 #   cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 #
 #   scripts/play-linux.sh [--machine 4060|4070|4090] [--console series-s|series-x]
-#                         [--windowed] [--no-panel] [--safe] [--raytracing] [--cmd run|shaders|warm]
+#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows]] [--cmd run|shaders|warm]
 #                         [KEY=VALUE ...]   extra VICTORY_* overrides
 #
 # Paths come from the environment (defaults in brackets):
@@ -44,7 +44,7 @@ fi
 build="${VICTORY_BUILD:-diag}"
 victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
 
-machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 cmd=run
+machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 rt_shadows=0 cmd=run
 extra=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -54,6 +54,7 @@ while [[ $# -gt 0 ]]; do
         --no-panel) panel=0; shift ;;
         --safe) safe=1; shift ;;
         --raytracing) rt=1; shift ;;
+        --rt-shadows) rt_shadows=1; shift ;;
         --cmd) cmd="$2"; shift 2 ;;
         VICTORY_*=*) extra+=("$1"); shift ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -137,6 +138,9 @@ fi
 # (the title's own bounced light and shadows; about a third slower).
 if [[ $rt == 1 ]]; then
     export VICTORY_BVH_BUILDER=1
+    # The ray-traced shadow passes left out (they trace every pixel; the
+    # bounced light that lights rooms stays): --rt-shadows keeps them.
+    [[ $rt_shadows == 1 ]] || export VICTORY_RT_SHADOWS=0
 else
     export VICTORY_AMBIENT=1.0 VICTORY_AMBIENT_SETTLE=4000,0 VICTORY_AMBIENT_AIR=2
 fi

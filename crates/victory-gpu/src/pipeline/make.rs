@@ -72,18 +72,20 @@ const RT_SHADOW_TRACES: [&[u8]; 3] =
 /// compiler died on them), they traced an acceleration structure never
 /// built, and smoke and haze in lit rooms showed brown and dark blotches
 /// (RTX 4060, Proton Experimental 11, the prison canteen). `0` leaves them
-/// out everywhere.
+/// out everywhere, with a BVH too: they trace every pixel, and an 8 GB card
+/// keeps the structure's memory over PCIe (with the builder, 4-8 fps on an
+/// RTX 4060); the bounced light that lights rooms stays.
 fn skip_rt_shadows() -> bool {
     static SKIP: OnceLock<bool> = OnceLock::new();
     *SKIP.get_or_init(|| {
+        let shadows = std::env::var("VICTORY_RT_SHADOWS").ok();
+        if shadows.as_deref() == Some("0") {
+            return true;
+        }
         if std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1") {
             return false;
         }
-        match std::env::var("VICTORY_RT_SHADOWS").ok().as_deref() {
-            Some("1") => false,
-            Some("0") => true,
-            _ => crate::host::on_wine(),
-        }
+        shadows.as_deref() != Some("1") && crate::host::on_wine()
     })
 }
 
