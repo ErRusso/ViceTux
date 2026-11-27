@@ -596,10 +596,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    static SAID: Mutex<u32> = Mutex::new(0);
+    // Said a few times for each role: one count for all of them let the
+    // first roles use it up, and a running role went unsaid.
+    static SAID: Mutex<[u32; 3]> = Mutex::new([0; 3]);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
+        let said = &mut said[role as usize];
+        if *said < 2 {
             *said += 1;
             tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
         }
