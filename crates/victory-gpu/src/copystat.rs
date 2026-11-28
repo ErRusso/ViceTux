@@ -914,6 +914,9 @@ fn log_memory() {
         targets[8],
         mb(targets[9]),
     );
+    if let Some(line) = crate::shadow::sparse_line() {
+        tracing::info!("memory, {line}");
+    }
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \

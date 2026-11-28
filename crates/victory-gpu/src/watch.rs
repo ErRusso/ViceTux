@@ -2241,6 +2241,7 @@ fn placeholder(block: usize) -> bool {
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
     forget_uncommitted(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    crate::shadow::sparse_let_go(at as u64, len as u64);
     if len == 0 {
         return;
     }
@@ -3868,6 +3869,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// write access is given back.
 pub fn title_memory_remapped(at: usize, len: usize) {
     forget_uncommitted(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    crate::shadow::sparse_let_go(at as u64, len as u64);
     crate::texback::remapped(at, len);
     open(&title_memory_changed(at, len), at, at.saturating_add(len));
 }

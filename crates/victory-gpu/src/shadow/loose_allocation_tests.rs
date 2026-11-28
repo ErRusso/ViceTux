@@ -195,14 +195,14 @@ fn unrelated_loose_lookups_and_parallel_allocations_proceed_while_a_window_is_pe
     }
     let fixture = CellFixture::new(3);
     let (cell_a, cell_b, cell_c) = (fixture.cells[0], fixture.cells[1], fixture.cells[2]);
-    let existing = loose_with(default_query(cell_b, K64 as u64), shared_only).unwrap();
+    let existing = loose_with(default_query(cell_b, K64 as u64), |_, len| shared_only(len)).unwrap();
     let follower_made = AtomicUsize::new(0);
     let parallel_made = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let (ready, waiting) = channel();
         let (go, resume) = channel();
         let first = scope.spawn(move || {
-            loose_with(default_query(cell_a, K64 as u64), |len| {
+            loose_with(default_query(cell_a, K64 as u64), |_, len| {
                 delayed_loose(&ready, &resume, len, shared_only)
             })
             .unwrap()
@@ -227,7 +227,7 @@ fn unrelated_loose_lookups_and_parallel_allocations_proceed_while_a_window_is_pe
             unrelated.as_ref().is_some_and(|s| Arc::ptr_eq(&existing, s)),
             "unrelated loose window must remain readable during pending allocation"
         );
-        let hit = loose_with(default_query(cell_b, K64 as u64), |_| {
+        let hit = loose_with(default_query(cell_b, K64 as u64), |_, _| {
             panic!("already-published window must not allocate")
         })
         .unwrap();
@@ -238,7 +238,7 @@ fn unrelated_loose_lookups_and_parallel_allocations_proceed_while_a_window_is_pe
         // BEFORE `first` is released.
         let parallel_count = &parallel_made;
         let parallel = scope.spawn(move || {
-            loose_with(default_query(cell_c, K64 as u64), |len| {
+            loose_with(default_query(cell_c, K64 as u64), |_, len| {
                 parallel_count.fetch_add(1, Ordering::Relaxed);
                 shared_only(len)
             })
@@ -252,7 +252,7 @@ fn unrelated_loose_lookups_and_parallel_allocations_proceed_while_a_window_is_pe
         // reuses the winner without allocating a duplicate.
         let follower_count = &follower_made;
         let follower = scope.spawn(move || {
-            loose_with(default_query(cell_a, K64 as u64), |len| {
+            loose_with(default_query(cell_a, K64 as u64), |_, len| {
                 follower_count.fetch_add(1, Ordering::Relaxed);
                 shared_only(len)
             })
@@ -299,7 +299,7 @@ fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_by
             let (ready, waiting) = channel();
             let (go, resume) = channel();
             let worker = scope.spawn(move || {
-                loose_with(q, |len| delayed_loose(&ready, &resume, len, shared_with_card))
+                loose_with(q, |_, len| delayed_loose(&ready, &resume, len, shared_with_card))
                     .unwrap()
             });
             waiting.recv().unwrap();
@@ -324,7 +324,7 @@ fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_by
                         use_holder: false,
                         grid: WINDOW,
                     },
-                    shared_only,
+                    |_, len| shared_only(len),
                 )
                 .unwrap()
             } else {
@@ -355,7 +355,7 @@ fn loose_reselects_concurrent_wider_tail_or_holder_and_gpu_readback_sees_live_by
             );
 
             // Verify hit path succeeds under `LOOSE.read()` even for tails/holder.
-            let again = loose_with(q, |_| panic!("tail/holder hit must not re-allocate")).unwrap();
+            let again = loose_with(q, |_, _| panic!("tail/holder hit must not re-allocate")).unwrap();
             assert!(Arc::ptr_eq(&again, &wider));
 
             // Prove byte-exact GPU refresh + readback from the published window.
@@ -376,8 +376,8 @@ fn loose_allocation_failure_leaves_window_open_to_retry() {
     let fixture = CellFixture::new(1);
     let cell = fixture.cells[0];
     let q = default_query(cell, K64 as u64);
-    assert!(loose_with(q, |_| None).is_none());
-    assert!(loose_with(q, shared_only).is_some());
+    assert!(loose_with(q, |_, _| None).is_none());
+    assert!(loose_with(q, |_, len| shared_only(len)).is_some());
 }
 
 #[test]

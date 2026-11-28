@@ -466,6 +466,9 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// A window whose empty tiles take no memory ([`sparse_windows`]): what
+    /// backs the others. Dropped after `buffer`, which reads them.
+    sparse: Option<Sparse>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -4269,6 +4272,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            sparse: None,
         }
     }
 
@@ -5392,6 +5396,23 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        // A sparse window: only its backed tiles (the others hold nothing of
+        // the title's, and writing zeros there would give them memory).
+        if let Some(sparse) = &self.sparse
+            && from < to
+        {
+            let mut done = 0;
+            for (a, b) in sparse.backed_within(from - start, to - start) {
+                done += self.copy_plain(start + a, start + b);
+            }
+            return done;
+        }
+        self.copy_plain(from, to)
+    }
+
+    /// [`Shadow::copy`] of `[from, to)`, inside the copy.
+    fn copy_plain(&self, from: usize, to: usize) -> usize {
+        let start = self.start as usize;
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         if self.card.is_some() && from < to && crate::host::upcheck::on() {
@@ -6234,6 +6255,35 @@ pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
         .map(|(k, e)| (k.0, e.end - k.0))
 }
 
+/// Title memory `[at, at + len)` was committed or mapped: sparse windows
+/// with an empty tile there ([`sparse_windows`]) are taken out of the table,
+/// so that the next ask makes one that holds it; lists that hold the old one
+/// keep it until they are done. Returns how many.
+pub(crate) fn sparse_let_go(at: u64, len: u64) -> u64 {
+    if !sparse_windows() || len == 0 {
+        return 0;
+    }
+    let end = at.saturating_add(len);
+    let gone: Vec<Arc<Shadow>> = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let keys: Vec<(u64, u64)> = map
+            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
+            .filter(|(key, shadow)| {
+                key.0 + key.1 > at
+                    && shadow.sparse.as_ref().is_some_and(|s| {
+                        let from = at.max(key.0) - key.0;
+                        let to = end.min(key.0 + key.1) - key.0;
+                        s.empty_within(from as usize, to as usize)
+                    })
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        keys.into_iter().filter_map(|key| map.remove(&key)).collect()
+    };
+    SPARSE_STATS[3].fetch_add(gone.len() as u64, Ordering::Relaxed);
+    gone.len() as u64
+}
+
 /// Title memory `[at, at + len)` is about to show something else or be
 /// given up: what is in place there (`crate::inplace`) is taken out of the
 /// tables, so that the next ask makes a copy or opens the memory anew, and
@@ -6628,6 +6678,360 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// Whether windows outside buffers whose title memory has uncommitted 64 KiB
+/// tiles take memory only for the others (`VICTORY_SPARSE_WINDOWS=1`; off by
+/// default; docs/superpowers/specs/2026-11-28-sparse-windows-design.md).
+///
+/// Every window was a host buffer of its whole size (4 MiB on the default
+/// grid), pinned, however little of it the title had: in gameplay (RTX 4060,
+/// Proton, 2026-11-28) 1.9 GB of the 3.35 GB of windows that could not be
+/// read in place lay over memory only reserved. Here such a window is a
+/// reserved buffer at one GPU address whose tiles over committed memory map
+/// to heaps opened on pages of ours, and the others to nothing: they read
+/// zeros, as the copy's zeros did, and writes to them are dropped. Windows
+/// in BAR memory (`VICTORY_WINDOWS_BAR_MB`) are made as before; a window
+/// with empty tiles takes this way before a place in the card's memory
+/// (`VICTORY_CARD_WINDOWS_MB`), whose budget is then left to full ones.
+fn sparse_windows() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SPARSE_WINDOWS").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("windows outside buffers take memory only for their committed tiles (VICTORY_SPARSE_WINDOWS=1)");
+        }
+        on
+    })
+}
+
+/// The tiles of a sparse window: what a reserved buffer maps.
+const TILE: usize = 64 << 10;
+
+/// Since the start: sparse windows made, their bytes, the bytes of their
+/// backed tiles, windows let go for memory committed over an empty tile,
+/// windows that fell back to a plain copy (a refusal), and those alive now
+/// with their bytes and backed bytes.
+static SPARSE_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// What backs a sparse window ([`sparse_windows`]): our pages for it
+/// (`VirtualAlloc`, committed whole: Linux gives a page memory only when it
+/// is touched), the heaps opened on the backed tiles' pages (pinned: the
+/// memory it takes), and which tiles those are.
+pub(crate) struct Sparse {
+    base: usize,
+    len: usize,
+    start: u64,
+    backed: Vec<bool>,
+    heaps: Vec<windows::Win32::Graphics::Direct3D12::ID3D12Heap>,
+    /// The frame its empty tiles were last asked about.
+    asked: AtomicU64,
+}
+
+// SAFETY: the pages are ours alone; D3D12 heaps are free-threaded.
+unsafe impl Send for Sparse {}
+// SAFETY: as above.
+unsafe impl Sync for Sparse {}
+
+/// Which 64 KiB tiles of title memory `[start, start + len)` hold a
+/// committed page (an unanswered question: all of the rest).
+fn backed_tiles(start: u64, len: u64) -> Vec<bool> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let tiles = len as usize / TILE;
+    let mut backed = vec![false; tiles];
+    let (start, end) = (start as usize, (start + len) as usize);
+    let mut at = start;
+    while at < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of an address, into a struct of its own size.
+        let n = unsafe { VirtualQuery(at as *const std::ffi::c_void, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            backed[(at - start) / TILE..].fill(true);
+            break;
+        }
+        let reach = (info.BaseAddress as usize).saturating_add(info.RegionSize).clamp(at + 1, end);
+        if info.State == MEM_COMMIT {
+            backed[(at - start) / TILE..=(reach - 1 - start) / TILE].fill(true);
+        }
+        at = reach;
+    }
+    backed
+}
+
+/// Runs `[first, past)` of the tiles for which `f` holds.
+fn tile_runs(tiles: &[bool], f: impl Fn(bool) -> bool) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut t = 0;
+    while t < tiles.len() {
+        if !f(tiles[t]) {
+            t += 1;
+            continue;
+        }
+        let first = t;
+        while t < tiles.len() && f(tiles[t]) {
+            t += 1;
+        }
+        runs.push((first, t));
+    }
+    runs
+}
+
+impl Sparse {
+    /// The reserved buffer and its backing for a window of title memory at
+    /// `start`, if it has an empty tile and everything could be made.
+    fn make(start: u64, len: u64) -> Option<(ID3D12Resource, Sparse)> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if !start.is_multiple_of(TILE as u64) || !len.is_multiple_of(TILE as u64) || len == 0 {
+            return None;
+        }
+        let backed = backed_tiles(start, len);
+        if backed.iter().all(|&b| b) {
+            return None;
+        }
+        let refused = |why: &dyn std::fmt::Display| {
+            SPARSE_STATS[4].fetch_add(1, Ordering::Relaxed);
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+                tracing::warn!(%why, start = format_args!("{start:#x}"), len, "a sparse window refused: a plain copy instead");
+            }
+        };
+        let host = host()?;
+        // SAFETY: a new allocation of ours.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        if base == 0 {
+            refused(&"no pages");
+            return None;
+        }
+        let mut sparse = Sparse { base, len: len as usize, start, backed, heaps: Vec::new(), asked: AtomicU64::new(crate::frame::current()) };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: len,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        if let Err(e) = unsafe { host.device.CreateReservedResource(&desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer) } {
+            refused(&e);
+            return None;
+        }
+        let buffer = buffer?;
+        let queue = host.queue();
+        // Everything to nothing first, then the backed runs to their heaps.
+        let at = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let all = D3D12_TILE_REGION_SIZE { NumTiles: (len as usize / TILE) as u32, ..Default::default() };
+        let null = D3D12_TILE_RANGE_FLAG_NULL;
+        // SAFETY: a live reserved buffer; the region is all of it. On the
+        // host's queue ahead of any list that reads it (none is recorded yet).
+        unsafe {
+            queue.UpdateTileMappings(&buffer, 1, Some(&raw const at), Some(&raw const all), None, 1, Some(&raw const null), None, Some(&raw const all.NumTiles), D3D12_TILE_MAPPING_FLAG_NONE);
+        }
+        let mut backed_bytes = 0;
+        for (first, past) in tile_runs(&sparse.backed, |b| b) {
+            let (from, bytes) = (base + first * TILE, (past - first) * TILE);
+            let heap = match crate::inplace::open(&host.device, crate::inplace::From::Part(from, bytes)) {
+                Ok(heap) => heap,
+                Err(e) => {
+                    refused(&e);
+                    return None;
+                }
+            };
+            let at = D3D12_TILED_RESOURCE_COORDINATE { X: first as u32, ..Default::default() };
+            let size = D3D12_TILE_REGION_SIZE { NumTiles: (past - first) as u32, ..Default::default() };
+            let (flag, offset) = (D3D12_TILE_RANGE_FLAG_NONE, 0u32);
+            // SAFETY: as above; the heap holds the run's tiles from its start.
+            unsafe {
+                queue.UpdateTileMappings(&buffer, 1, Some(&raw const at), Some(&raw const size), &heap, 1, Some(&raw const flag), Some(&raw const offset), Some(&raw const size.NumTiles), D3D12_TILE_MAPPING_FLAG_NONE);
+            }
+            sparse.heaps.push(heap);
+            backed_bytes += bytes as u64;
+        }
+        for (i, n) in [(0, 1), (1, len), (2, backed_bytes), (5, 1), (6, len), (7, backed_bytes)] {
+            SPARSE_STATS[i].fetch_add(n, Ordering::Relaxed);
+        }
+        Some((buffer, sparse))
+    }
+
+    /// The backed runs `[from, to)` of offsets `[from, to)` of the window.
+    fn backed_within(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
+        let (first, past) = (from / TILE, to.div_ceil(TILE).min(self.backed.len()));
+        tile_runs(&self.backed[first..past], |b| b)
+            .into_iter()
+            .map(|(a, b)| (((first + a) * TILE).max(from), ((first + b) * TILE).min(to)))
+            .filter(|(a, b)| a < b)
+            .collect()
+    }
+
+    /// Whether an empty tile lies in offsets `[from, to)` of the window.
+    fn empty_within(&self, from: usize, to: usize) -> bool {
+        let (first, past) = (from / TILE, to.div_ceil(TILE).min(self.backed.len()));
+        self.backed[first..past].iter().any(|&b| !b)
+    }
+
+    /// At most once in 32 frames: whether title memory was committed over an
+    /// empty tile since the window was made (by a way we are not told of:
+    /// the runtime's commits and mappings let it go at once,
+    /// [`sparse_let_go`]). Seldom, as each asking walks the window's regions
+    /// under Wine's process-wide lock.
+    fn stale(&self) -> bool {
+        let now = crate::frame::current();
+        let was = self.asked.load(Ordering::Relaxed);
+        if now < was.saturating_add(32) || self.asked.compare_exchange(was, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        let now_backed = backed_tiles(self.start, self.len as u64);
+        now_backed.iter().zip(&self.backed).any(|(&now, &was)| now && !was)
+    }
+}
+
+impl Drop for Sparse {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // The reserved buffer went first (`Shadow::buffer`); the heaps on
+        // our pages, then the pages.
+        SPARSE_STATS[5].fetch_sub(1, Ordering::Relaxed);
+        SPARSE_STATS[6].fetch_sub(self.len as u64, Ordering::Relaxed);
+        let backed = self.backed.iter().filter(|&&b| b).count() * TILE;
+        SPARSE_STATS[7].fetch_sub(backed as u64, Ordering::Relaxed);
+        self.heaps.clear();
+        // SAFETY: our own allocation, which nothing maps any more.
+        unsafe {
+            let _ = VirtualFree(self.base as *mut std::ffi::c_void, 0, MEM_RELEASE);
+        }
+    }
+}
+
+/// For the memory line: what the sparse windows are and hold.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn sparse_line() -> Option<String> {
+    if !sparse_windows() {
+        return None;
+    }
+    let g = |i: usize| SPARSE_STATS[i].load(Ordering::Relaxed);
+    Some(format!(
+        "sparse windows (VICTORY_SPARSE_WINDOWS=1): {} alive over {} MB of title memory, {} MB of it backed; \
+         since the start {} made ({} MB, {} MB backed), {} let go for memory committed over an empty tile, {} refused",
+        g(5),
+        g(6) >> 20,
+        g(7) >> 20,
+        g(0),
+        g(1) >> 20,
+        g(2) >> 20,
+        g(3),
+        g(4)
+    ))
+}
+
+#[cfg(test)]
+mod sparse_tests {
+    use super::{Sparse, TILE, backed_tiles, build_loose_shadow, tile_runs, LooseBacking};
+    use std::sync::atomic::AtomicU64;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    fn sparse(backed: &[bool]) -> Sparse {
+        Sparse { base: 0, len: backed.len() * TILE, start: 0, backed: backed.to_vec(), heaps: Vec::new(), asked: AtomicU64::new(0) }
+    }
+
+    #[test]
+    fn runs_of_tiles() {
+        let t = [false, true, true, false, true];
+        assert_eq!(tile_runs(&t, |b| b), [(1, 3), (4, 5)]);
+        assert_eq!(tile_runs(&t, |b| !b), [(0, 1), (3, 4)]);
+        assert!(tile_runs(&[], |b| b).is_empty());
+    }
+
+    #[test]
+    fn copies_keep_to_the_backed_tiles() {
+        let s = sparse(&[false, true, true, false, true]);
+        assert_eq!(s.backed_within(0, 5 * TILE), [(TILE, 3 * TILE), (4 * TILE, 5 * TILE)]);
+        // Cut to the range asked.
+        assert_eq!(s.backed_within(TILE + 10, 2 * TILE + 20), [(TILE + 10, 2 * TILE + 20)]);
+        assert!(s.backed_within(10, 20).is_empty());
+        assert_eq!(s.backed_within(3 * TILE - 4, 4 * TILE + 4), [(3 * TILE - 4, 3 * TILE), (4 * TILE, 4 * TILE + 4)]);
+        assert!(s.empty_within(0, 1));
+        assert!(!s.empty_within(TILE, 3 * TILE));
+        assert!(s.empty_within(3 * TILE - 1, 3 * TILE + 1));
+        std::mem::forget(s); // (nothing of it was allocated)
+    }
+
+    /// A region of 4 MiB with tiles 1-2 and 16 committed (`0x11`, `0x22`).
+    fn title() -> usize {
+        // SAFETY: allocations of our own.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 4 << 20, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert!(base != 0);
+            for (at, len, byte) in [(TILE, 2 * TILE, 0x11u8), (16 * TILE, TILE, 0x22)] {
+                let p = VirtualAlloc((base + at) as *const _, len, MEM_COMMIT, PAGE_READWRITE) as usize;
+                assert_eq!(p, base + at);
+                std::ptr::write_bytes(p as *mut u8, byte, len);
+            }
+            base
+        }
+    }
+
+    #[test]
+    fn committed_pages_back_their_tiles() {
+        let base = title();
+        let backed = backed_tiles(base as u64, 4 << 20);
+        assert_eq!(backed.len(), 64);
+        assert_eq!(tile_runs(&backed, |b| b), [(1, 3), (16, 17)]);
+        // SAFETY: ours.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The GPU reads a sparse window as the title has it: the committed
+    /// tiles' bytes, zeros elsewhere, and what the title writes after a
+    /// refresh once it is copied.
+    #[test]
+    fn the_gpu_reads_a_sparse_window_as_the_title_has_it() {
+        let Some(host) = crate::host::host() else { return };
+        let base = title();
+        let len = 4u64 << 20;
+        let Some((buffer, sparse)) = Sparse::make(base as u64, len) else {
+            eprintln!("no sparse window on this host; not run");
+            return;
+        };
+        let shadow = build_loose_shadow(base as u64, len, LooseBacking::Sparse { buffer, sparse });
+        shadow.copy(base, base + len as usize);
+        // Read back on the host's queue, behind the window's tile mappings,
+        // as the lists that read it are.
+        let fetch = |offset: u64, bytes: usize| -> Vec<u8> {
+            let back = host.read_back_buffer(bytes as u64).expect("a read-back buffer");
+            let list = host.new_list().expect("a list");
+            // SAFETY: an open list; both buffers live through the copy.
+            unsafe { list.list.CopyBufferRegion(&back, 0, &shadow.buffer, offset, bytes as u64) };
+            list.close();
+            host.execute(&[&list]);
+            let mut data = std::ptr::null_mut();
+            // SAFETY: execute waited for the copy; the mapping holds `bytes`.
+            unsafe {
+                back.Map(0, None, Some(&mut data)).expect("map");
+                let got = std::slice::from_raw_parts(data.cast::<u8>(), bytes).to_vec();
+                back.Unmap(0, None);
+                got
+            }
+        };
+        let got = fetch(0, len as usize);
+        let tile = |t: usize| &got[t * TILE..(t + 1) * TILE];
+        for (t, byte) in [(0, 0), (1, 0x11), (2, 0x11), (3, 0), (16, 0x22), (17, 0), (63, 0)] {
+            assert!(tile(t).iter().all(|&x| x == byte), "tile {t}");
+        }
+        // SAFETY: committed title memory of ours.
+        unsafe { std::ptr::write_bytes((base + TILE + 8) as *mut u8, 0x5a, 8) };
+        shadow.copy(base + TILE, base + TILE + 64);
+        assert_eq!(fetch((TILE + 8) as u64, 8), [0x5a; 8]);
+        drop(shadow);
+        // SAFETY: ours.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+}
+
 type LooseTable = BTreeMap<(u64, u64), Arc<Shadow>>;
 type PendingTickets = Mutex<BTreeMap<(u64, u64), Weak<Mutex<()>>>>;
 
@@ -6653,6 +7057,11 @@ fn pending_ticket(table: &PendingTickets, key: (u64, u64)) -> Arc<Mutex<()>> {
 }
 
 enum LooseBacking {
+    /// Empty tiles without memory ([`sparse_windows`]).
+    Sparse {
+        buffer: ID3D12Resource,
+        sparse: Sparse,
+    },
     Mapped {
         buffer: ID3D12Resource,
         data: *mut u8,
@@ -6664,7 +7073,16 @@ enum LooseBacking {
     },
 }
 
-fn make_loose_backing(len: u64) -> Option<LooseBacking> {
+fn make_loose_backing(start: u64, len: u64) -> Option<LooseBacking> {
+    // Empty tiles without memory, unless windows are to be in BAR memory. A
+    // window with empty tiles goes this way before the card's budget for
+    // windows (`VICTORY_CARD_WINDOWS_MB`), which is left to full ones.
+    if sparse_windows()
+        && window_mapped_most() == 0
+        && let Some((buffer, sparse)) = Sparse::make(start, len)
+    {
+        return Some(LooseBacking::Sparse { buffer, sparse });
+    }
     // One buffer in the card's memory, filled by the CPU through the bus.
     if let Some((buffer, data)) = window_mapped_for(len) {
         return Some(LooseBacking::Mapped { buffer, data });
@@ -6678,6 +7096,16 @@ fn make_loose_backing(len: u64) -> Option<LooseBacking> {
 
 fn build_loose_shadow(start: u64, len: u64, backing: LooseBacking) -> Arc<Shadow> {
     match backing {
+        LooseBacking::Sparse { buffer, sparse } => {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}, empty tiles without memory"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let data = sparse.base as *mut u8;
+            let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+            shadow.window = true;
+            shadow.sparse = Some(sparse);
+            Arc::new(shadow)
+        }
         LooseBacking::Mapped { buffer, data } => {
             crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
             // SAFETY: a live buffer.
@@ -6761,7 +7189,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 
 fn loose_with(
     q: LooseQuery,
-    make: impl Fn(u64) -> Option<LooseBacking>,
+    make: impl Fn(u64, u64) -> Option<LooseBacking>,
 ) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(q.address, q.end, WINDOW);
     let named = window_of(q.address, q.end, q.grid);
@@ -6789,6 +7217,12 @@ fn loose_with(
             let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
             let key = loose_key_with(&map, cell, named, q);
             if let Some(shadow) = map.get(&key) {
+                if shadow.sparse.as_ref().is_some_and(Sparse::stale) {
+                    // Memory came over an empty tile: a new window holds it.
+                    drop(map);
+                    sparse_let_go(key.0, key.1);
+                    continue;
+                }
                 note(shadow);
                 return Some(shadow.clone());
             }
@@ -6811,7 +7245,7 @@ fn loose_with(
                 map.insert((start, len), shadow.clone());
                 return Some(shadow);
             }
-            let shadow = build_loose_shadow(start, len, make(len)?);
+            let shadow = build_loose_shadow(start, len, make(start, len)?);
             if shadow.card.is_some() {
                 CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
             }
@@ -6835,7 +7269,7 @@ fn loose_with(
                 continue;
             }
         }
-        let candidate = build_loose_shadow(key.0, key.1, make(key.1)?);
+        let candidate = build_loose_shadow(key.0, key.1, make(key.0, key.1)?);
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let selected = loose_key_with(&map, cell, named, q);
         if let Some(existing) = map.get(&selected) {
