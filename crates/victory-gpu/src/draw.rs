@@ -2884,8 +2884,31 @@ impl State {
                 crate::texture::live_staging_bytes(),
             )
         };
+        // A frame's runs of the pass (its own and the early ones, not those
+        // before a bake) within `VICTORY_TEXSPK_PASS_MS` together
+        // ([`texspk_pass_ms`]).
+        let frame_pass = !required && !baking && sync.is_none();
+        let span = match texspk_pass_ms() {
+            Some(cap) if frame_pass => {
+                if PASS_FRAME.swap(frame, Ordering::Relaxed) != frame {
+                    PASS_FRAME_NANOS.store(0, Ordering::Relaxed);
+                }
+                pass_span_left(span, cap, PASS_FRAME_NANOS.load(Ordering::Relaxed))
+            }
+            _ => span,
+        };
 
         let began = std::time::Instant::now();
+        // The pass's time, counted for the frame's cap however the pass ends.
+        struct Count(std::time::Instant, bool);
+        impl Drop for Count {
+            fn drop(&mut self) {
+                if self.1 {
+                    PASS_FRAME_NANOS.fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                }
+            }
+        }
+        let _count = Count(began, frame_pass && texspk_pass_ms().is_some());
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
@@ -5484,6 +5507,43 @@ fn frame_ms(frame: u64, now: u64) -> u64 {
     (last.2 as u64).max(1)
 }
 
+/// The frame [`PASS_FRAME_NANOS`] counts for, and the nanoseconds its runs
+/// of the pass over textures picked by index took ([`texspk_pass_ms`]).
+static PASS_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+static PASS_FRAME_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// The milliseconds a frame's runs of the pass over textures picked by index
+/// take together at most (`VICTORY_TEXSPK_PASS_MS=<n>`, 1 to 1000; unset or
+/// 0: each run within `VICTORY_TEXTURE_STAGE_MS` alone, as before). The
+/// slots left wait for the next frame's runs, as those past a run's time do
+/// now; runs before a bake keep their own budget.
+///
+/// Ported from trustno1-coder/VIctory-NVIDIA 64d4931: the pass runs several
+/// times a frame (its own, the early one at the frame's first draw):
+/// walking through the world it took 2.2-2.7 s of each 5 seconds in the
+/// stretches with frames over 50 ms, 0.6-0.9 s in calm ones. With 8 ms (RTX
+/// 4090, Ryzen 9 7950X3D, the walking route through the first boat mission)
+/// the mean went from 39.4 to 47.0 fps there. What changes for the picture:
+/// a texture picked by index may show a frame or more later in such a burst
+/// (its slot shows what it showed until then).
+fn texspk_pass_ms() -> Option<u64> {
+    static MS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_TEXSPK_PASS_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)
+            .map(|ms| ms.min(1000))
+    })
+}
+
+/// A run's time within the frame's cap of `cap_ms` milliseconds when the
+/// frame's runs took `spent_ns` nanoseconds already: no more than `span`.
+fn pass_span_left(span: std::time::Duration, cap_ms: u64, spent_ns: u64) -> std::time::Duration {
+    let cap = std::time::Duration::from_millis(cap_ms);
+    span.min(cap.saturating_sub(std::time::Duration::from_nanos(spent_ns)))
+}
+
 /// Per-frame texture staging byte budget scaled from the adapter's local VRAM
 /// budget (`None` keeps the 192 MiB 12 GiB baseline).
 fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
@@ -5500,6 +5560,20 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{View, is_depth_companion, is_depth_srv, staging_budget_per_frame};
+
+    #[test]
+    fn a_frames_pass_runs_share_the_texspk_cap() {
+        use super::pass_span_left;
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // The first run of a frame: the run's own time, or the cap if less.
+        assert_eq!(pass_span_left(ms(16), 8, 0), ms(8));
+        assert_eq!(pass_span_left(ms(4), 8, 0), ms(4));
+        // Later runs: what the frame has left.
+        assert_eq!(pass_span_left(ms(16), 8, 5_000_000), ms(3));
+        // Spent: nothing (the run stops at its first slot).
+        assert_eq!(pass_span_left(ms(16), 8, 9_000_000), Duration::ZERO);
+    }
 
     #[test]
     fn depth_srv_checks_the_plane_not_the_number_of_levels() {

@@ -7378,6 +7378,11 @@ impl Host {
         }
         let behind = late && flying();
         stage.next("submit: gathering what to ask about");
+        // The helpers awake from here to the end (`VICTORY_PASSES_HOT`,
+        // `crate::shadow::passes_hot_us`, from trustno1-coder/VIctory-NVIDIA
+        // 64d4931): this submission's passes find them so, the waking
+        // overlapping the asking below.
+        let _hot = crate::shadow::hot();
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         for list in runs {
             list.submitted_in.store(this_submission, Ordering::Relaxed);
