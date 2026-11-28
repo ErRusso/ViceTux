@@ -163,8 +163,10 @@ else
     # Windows over memory the title only reserved take memory only for their
     # committed 64 KiB tiles (a reserved buffer; the empty tiles read zeros):
     # in gameplay 1.9 GB of the windows' 3.35 GB that could not be read in
-    # place lay over such memory. SPARSE_WINDOWS=0: full copies, as before.
-    export VICTORY_SPARSE_WINDOWS="${SPARSE_WINDOWS:-1}"
+    # place lay over such memory. Off: with the title's buffers copied this
+    # way too the process ended without a trace 46 s into a run (1,413 made,
+    # private memory in use 19.3 GB against 27.2); SPARSE_WINDOWS=1 to test.
+    export VICTORY_SPARSE_WINDOWS="${SPARSE_WINDOWS:-0}"
     # Not play.ps1's NVIDIA VICTORY_PLACED_ORDER=1 VICTORY_PLACED_FILL_REDIRECT=1:
     # here, with card steps at stage 1, gameplay fell from 13.0 to 8.4 fps with
     # them and the textures waiting for their memory from a median of 136 to
