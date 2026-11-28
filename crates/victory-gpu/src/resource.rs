@@ -1450,6 +1450,26 @@ pub(crate) fn want_level(this: This, first: u32) {
     if host.base == 0 || host.base <= base_level(&r.desc, first) {
         return;
     }
+    // One the host copied into keeps its host copy: the new one would be
+    // filled from title memory, which the copy never reached (zeros or
+    // another texture's bytes). Not seen in the prison yard's opening
+    // (2026-11-28); `VICTORY_KEEP_COPIED=0`: replaced, as before.
+    static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *KEEP.get_or_init(|| std::env::var_os("VICTORY_KEEP_COPIED").is_none_or(|v| v != "0"))
+        && crate::texture::host_wrote(this as usize)
+    {
+        static KEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = KEPT.fetch_add(1, Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                kept = n,
+                first,
+                base = host.base,
+                "a host copy the host wrote into is kept although a view starts at a larger level (VICTORY_KEEP_COPIED=0: replaced)"
+            );
+        }
+        return;
+    }
     r.host.wanted.store(first, Relaxed);
     // Under the lock, as in `let_go_idle`.
     crate::texture::unstage(this);
@@ -3179,6 +3199,31 @@ pub(crate) extern "system" fn create_at_address(
 #[cfg(windows)]
 static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 14]), usize>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The subresource of `this`'s host copy that the title's subresource
+/// `index` is: the host copy begins at level `base` ([`held_only`]), so
+/// its level 0 is the title's level `base`. `None`: a level the host copy
+/// does not hold (no view shows it). The title's bake copies its compressed
+/// decorations into levels 3 to 10 of 1024x1024 BC3 textures (11 levels)
+/// whose host copies begin at level 3 (8 levels): given the title's
+/// numbers, levels 3 to 7 went into host levels of other sizes and 8 to 10
+/// past the last. (The tattooed arms stay black or in coloured blocks with
+/// this: another cause, 2026-11-28.)
+#[cfg(windows)]
+pub(crate) fn host_subresource(this: This, index: u32) -> Option<u32> {
+    let Some(copy) = made_copy(this) else {
+        return Some(index);
+    };
+    let levels = u32::from(resource(this).desc.mip_levels);
+    if copy.base == 0 || levels == 0 {
+        return Some(index);
+    }
+    // SAFETY: a live texture.
+    let host_levels = u32::from(unsafe { copy.texture.GetDesc() }.MipLevels);
+    let (level, layer) = (index % levels, index / levels);
+    let at = level.checked_sub(copy.base)?;
+    (at < host_levels).then_some(layer * host_levels + at)
+}
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].

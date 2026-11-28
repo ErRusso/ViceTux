@@ -1198,6 +1198,25 @@ extern "system" fn copy_texture_region(
                 None => list.note_op(text),
             }
         }
+        // The title's level numbers, as the host copies have them: one
+        // that begins at a later level ([`crate::resource::host_subresource`]).
+        let held = |location: &CopyLocation, at: &mut u64| match crate::resource::host_subresource(location.resource, *at as u32) {
+            Some(index) => {
+                *at = u64::from(index);
+                true
+            }
+            None => false,
+        };
+        if (dst.kind != FOOTPRINT && !held(&dst, &mut to_location.footprint.offset))
+            || (src.kind != FOOTPRINT && !held(&src, &mut from.footprint.offset))
+        {
+            static LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LEFT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(copies = n, "a copy into or from a level a host copy does not hold is left out");
+            }
+            return;
+        }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
         // SAFETY: an open list; both locations in the host's layout, naming
