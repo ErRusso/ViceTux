@@ -3527,7 +3527,15 @@ impl State {
                 DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
                 DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
             };
-            let Some((seen, depth)) = entry(ResourceType::Srv, MISS_DEPTH) else {
+            let fits_size = |d: &D3D12_RESOURCE_DESC| {
+                d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    && d.Width.abs_diff(of.Width * 2) <= 1
+                    && u64::from(d.Height).abs_diff(u64::from(of.Height) * 2) <= 1
+            };
+            let found = entry(ResourceType::Srv, MISS_DEPTH)
+                .filter(|(d, _)| fits_size(d))
+                .or_else(|| self.frame_depth([of.Width, u64::from(of.Height)]));
+            let Some((seen, depth)) = found else {
                 once!(?role, "no stand-in for the indirect light: missing depth SRV");
                 crate::ambient::note_miss(MissNote::NotReady);
                 return false;
@@ -3592,6 +3600,58 @@ impl State {
             crate::ambient::note_miss(MissNote::Ran(layer));
         }
         ran
+    }
+
+    /// The picture's depth for the stand-in for reflections when the miss
+    /// program's own place holds none (in the opening's cutscenes a 1x1
+    /// texture: no stand-in for 80 s, the bright sky in dark rooms and on
+    /// eyes). It is still in the frame's table 0, at a place this program
+    /// does not read: every place of that table, the depth-stencil target's
+    /// depth plane first, then any 32-bit depth of twice `half` (the miss
+    /// image's size). From trustno1-coder/VIctory-NVIDIA 64d4931.
+    fn frame_depth(&self, half: [u64; 2]) -> Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)> {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_R32G8X24_TYPELESS,
+        };
+        let heap = (self.heaps[0] != 0).then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()?;
+        let Some(Root::Table(table)) = self.roots_ref(true).first() else { return None };
+        let start = match self.ambient_tables.iter().find(|m| m.0 == 0) {
+            Some(m) => m.1,
+            None => self.user_value(true, 0, RootType::Table, 0),
+        };
+        let mut plain = None;
+        for offset in (0..1600u32).step_by(8) {
+            let Some(view) = crate::descriptor::view(table + u64::from(offset) * 4) else { continue };
+            let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
+            // (Stencil planes and stencil formats left: depth alone.)
+            let View::Shader(resource, desc) = view else { continue };
+            if desc.as_ref().is_some_and(|d| matches!(crate::resource::pc_format(d[0]), 22 | 47) || (d[1] == 4 && d[6] == 1)) {
+                continue;
+            }
+            let Some(host) = crate::resource::host_resource(resource as This) else { continue };
+            // SAFETY: a live resource.
+            let d = unsafe { host.GetDesc() };
+            let fits = d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && d.Width.abs_diff(half[0] * 2) <= 1
+                && u64::from(d.Height).abs_diff(half[1] * 2) <= 1;
+            if !fits {
+                continue;
+            }
+            let found = (d, heap.gpu_handle((start + offset * 4) / 32));
+            match d.Format {
+                DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT => {
+                    static WIDE: AtomicU64 = AtomicU64::new(0);
+                    if WIDE.fetch_add(1, Ordering::Relaxed) == 0 {
+                        tracing::info!(offset, "reflections stand-in: the picture's depth taken from the frame's table, a place the miss program does not read (counted once)");
+                    }
+                    return Some(found);
+                }
+                DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT if plain.is_none() => plain = Some(found),
+                _ => {}
+            }
+        }
+        plain
     }
 
     /// The view a shader of the bound pipeline reads through a table, at
