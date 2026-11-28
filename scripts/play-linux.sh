@@ -4,7 +4,7 @@
 #   cargo xwin build --locked --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
 #
 #   scripts/play-linux.sh [--machine 4060|4070|4090] [--console series-s|series-x]
-#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows] | --rt-low] [--dlss quality|balanced|performance] [--breadcrumbs] [--cmd run|shaders|warm]
+#                         [--windowed] [--no-panel] [--safe] [--raytracing [--rt-shadows] | --rt-low] [--dlss quality|balanced|performance] [--breadcrumbs] [--cmd run|shaders|warm|translate]
 #                         [KEY=VALUE ...]   extra VICTORY_* overrides
 #
 # Paths come from the environment (defaults in brackets):
@@ -44,7 +44,7 @@ else
     proton="${PROTON:-$HOME/.steam/steam/steamapps/common/Proton - Experimental/proton}"
 fi
 build="${VICTORY_BUILD:-diag}"
-victory="$repo/target/x86_64-pc-windows-msvc/$build/victory.exe"
+victory="${LAYER_EXE:-$repo/target/x86_64-pc-windows-msvc/$build/victory.exe}"
 
 machine=auto console=series-s windowed=0 panel=1 safe=0 rt=0 rt_shadows=0 rt_low=0 dlss= crumbs=0 cmd=run
 extra=()
@@ -108,6 +108,12 @@ export VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1
 # 16-17 at stage 2, 10.6 with none.
 export VICTORY_CARD_STEPS="${CARD_STEPS:-1}"
 export VICTORY_TITLE_PRIORITIES=0 VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
+# Left out, as trustno1-coder/VIctory-NVIDIA's launcher does (its
+# VICTORY_LEAVE_OUT; here VICTORY_SKIP_PIPELINES, which works in every build):
+# the decal heap's defragmentation (02384a60fda6f2d0, 5.6-11.9 ms of the card
+# a frame there) and the heat-haze / in-scattering pass (731a39171b568298,
+# which smears blocks of pixels, also on water). LEAVE_OUT= (empty) runs both.
+export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES:-${LEAVE_OUT-02384a60fda6f2d0,731a39171b568298}}"
 
 if [[ $machine == 7900xtx ]]; then
     export VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1
@@ -143,6 +149,11 @@ if [[ $safe == 1 ]]; then
     export VICTORY_UNDER_WIDE=0 VICTORY_LAND_ECHO=0
 else
     export VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_INDIRECT_BATCH=2
+    # From trustno1-coder/VIctory-NVIDIA's launcher: a frame's runs of the
+    # pass over textures picked by index take 8 ms together at most (39 to
+    # 47 fps walking there), and the helper threads are woken at each
+    # submission's start (longest frame walking 525 to 145 ms there).
+    export VICTORY_TEXSPK_PASS_MS="${TEXSPK_PASS_MS:-8}" VICTORY_PASSES_HOT="${PASSES_HOT:-1}"
     # Windows of the title's private memory read in place: the GPU reads the
     # title's bytes through a heap opened on them instead of a copy
     # (vkd3d-proton on NVIDIA refused none; in play 77 windows, 368 MB not
@@ -172,6 +183,11 @@ else
     export VICTORY_AMBIENT=1.0 VICTORY_AMBIENT_SETTLE=4000,0 VICTORY_AMBIENT_AIR=2
     # The least bounced light anywhere: rooms kept some light with their lamps off screen.
     export VICTORY_AMBIENT_FLOOR="${AMBIENT_FLOOR:-0.35}"
+    # Reflections whose rays find nothing take the estimate along the
+    # reflected direction instead of the sky's bright blue (glowing eyes,
+    # blue blotches on floors): trustno1-coder/VIctory-NVIDIA's default.
+    # AMBIENT_SPECULAR=0: the title's sky.
+    export VICTORY_AMBIENT_SPECULAR="${AMBIENT_SPECULAR:-1}"
 fi
 # The game's entries on a spinning disk (fast-copy.sh links them): the
 # streaming reads at most a few of them at once (VICTORY_DSTORAGE_SLOW_MAX),
@@ -252,7 +268,10 @@ fi
 cd "$repo"
 case "$cmd" in
     run) exec "$proton" run "$victory" run "$(winpath "$exe")" --console "$console" --execute ;;
-    shaders) exec "$proton" run "$victory" shaders ;;
+    # SHADERS_LIST=<file>: also list every shader that does not translate (hash, where, why).
+    shaders) exec "$proton" run "$victory" shaders ${SHADERS_LIST:+--list "$(winpath "$SHADERS_LIST")"} ;;
     warm) exec "$proton" run "$victory" warm --used ;;
+    # Every shader of the title through the translator, one line per program and outcome.
+    translate) exec "$proton" run "$victory" translate "$(winpath "$game_dir")" --verbose ;;
     *) echo "unknown --cmd $cmd" >&2; exit 2 ;;
 esac
