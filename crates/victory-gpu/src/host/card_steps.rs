@@ -1352,6 +1352,10 @@ impl Host {
         }
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
+        // (Where it is: to tell a fault in it from one elsewhere.)
+        // SAFETY: a live buffer.
+        let gpu = unsafe { between.GetGPUVirtualAddress() };
+        tracing::info!(gpu = format_args!("{gpu:#x}"), bytes = BETWEEN, "steps on the card: a buffer between made");
         let list = self.new_list().ok()?;
         Some(Own { list, between })
     }

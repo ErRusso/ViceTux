@@ -1628,6 +1628,12 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// [`Lower::buffer_slot_guard`] (`VICTORY_SLOT_GUARD=0`: off).
+fn slot_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_GUARD").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -7771,6 +7777,7 @@ impl<'a> Lower<'a> {
         let h = if image.is_none() && !self.x.res.waterfall.loads.contains(&site) {
             let index = self.heap_index(site, first, false)?;
             let (index, bounded) = self.raw_twin(&src, index, false, props);
+            let index = if bounded { index } else { self.buffer_slot_guard(&src, index, false, props)? };
             self.s.size_handle_at(self.cur, index, props, bounded)
         } else {
             self.handle(site, &src, false, props)?
@@ -8491,6 +8498,7 @@ impl<'a> Lower<'a> {
                 }
                 let index = self.heap_index(*load, *first, sampler)?;
                 let (index, bounded) = self.raw_twin(src, index, sampler, props);
+                let index = if bounded { index } else { self.buffer_slot_guard(src, index, sampler, props)? };
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
@@ -8588,6 +8596,51 @@ impl<'a> Lower<'a> {
     /// a pixel program of the main pass (3711fdad456538a1, stopped at in the
     /// device losses of runs n03 and n04) reads a structured one of 8 byte
     /// elements at 8 as raw bytes per lane.
+    /// A buffer picked from the view heap at an index the program computes,
+    /// on a host without raw twins ([`Self::raw_twin`]): the null slot
+    /// instead where the slot holds no buffer view (its word in
+    /// [`super::shader::SLOT_STRIDES`] has no stride: a texture, a constant
+    /// buffer, nothing); for a constant buffer, where it is not marked one
+    /// ([`super::shader::VIEW_CONSTANT`]).
+    ///
+    /// The console reads such a slot as a buffer whatever it holds. An NVIDIA
+    /// host reads the texture's descriptor as a buffer's: its "address" is a
+    /// number out of the texture's header, and the card faults reading there
+    /// through its constant cache (Xid 31 GPCCLIENT_GCC at 0x5_8d249000 and
+    /// 0x5_8d7ff000, RTX 4060 under Proton: the very digits of the headers of
+    /// the render targets in title slots 19-26 and 64-65). `VICTORY_SLOT_GUARD=0`:
+    /// the slot as it is.
+    fn buffer_slot_guard(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> Result<V, Why> {
+        // Typed, raw and structured buffers (DXIL resource kinds 10-12), and
+        // constant buffers (13).
+        let kind = props.0 & 0xFF;
+        if sampler || super::shader::raw_views() != 0 || !matches!(kind, 10..=13) || !slot_guard_on() {
+            return Ok(index);
+        }
+        let null = super::shader::view_heap_limit();
+        if null == 0 {
+            return Ok(index);
+        }
+        let Some(word) = self.slot_word(src, true)? else {
+            return Ok(index);
+        };
+        let c = self.cur;
+        // A buffer: a stride. A constant buffer: its mark alone.
+        let (bits, wanted) = if kind == 13 {
+            (super::shader::VIEW_INTEGER | super::shader::VIEW_CONSTANT, super::shader::VIEW_CONSTANT)
+        } else {
+            (super::shader::VIEW_STRIDE_BITS, 0)
+        };
+        let masked = {
+            let bits = self.s.m.i32(bits);
+            self.s.m.bin(c, Bin::And, word, bits)
+        };
+        let wanted = self.s.m.i32(wanted);
+        let none = self.s.m.cmp(c, if kind == 13 { pred::NE } else { pred::EQ }, masked, wanted);
+        let null = self.s.m.i32(null);
+        Ok(self.s.m.select(c, none, null, index))
+    }
+
     fn raw_twin(&mut self, src: &Source, index: V, sampler: bool, props: (u32, u32)) -> (V, bool) {
         // Raw and constant buffers (DXIL resource kinds 11 and 13).
         const RAW: u32 = 11;

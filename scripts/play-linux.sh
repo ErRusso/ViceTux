@@ -109,11 +109,13 @@ export VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1
 export VICTORY_CARD_STEPS="${CARD_STEPS:-1}"
 export VICTORY_TITLE_PRIORITIES=0 VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
 # Left out, as trustno1-coder/VIctory-NVIDIA's launcher does (its
-# VICTORY_LEAVE_OUT; here VICTORY_SKIP_PIPELINES, which works in every build):
-# the decal heap's defragmentation (02384a60fda6f2d0, 5.6-11.9 ms of the card
-# a frame there) and the heat-haze / in-scattering pass (731a39171b568298,
-# which smears blocks of pixels, also on water). LEAVE_OUT= (empty) runs both.
-export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES:-${LEAVE_OUT-02384a60fda6f2d0,731a39171b568298}}"
+# VICTORY_LEAVE_OUT; here VICTORY_SKIP_PIPELINES): the heat-haze /
+# in-scattering pass (731a39171b568298), which smears blocks of pixels, also
+# on water. Not their other one, the decal heap's defragmentation
+# (02384a60fda6f2d0): it translates here, and the passes after it apply its
+# relocations; left out, both of the day's runs at card steps 1 faulted
+# (Xid 31 at 0x5_8d249000). LEAVE_OUT= (empty) runs the haze pass too.
+export VICTORY_SKIP_PIPELINES="${VICTORY_SKIP_PIPELINES:-${LEAVE_OUT-731a39171b568298}}"
 
 if [[ $machine == 7900xtx ]]; then
     export VICTORY_MAP_THREADS=1 VICTORY_CARD_AWAKE=1

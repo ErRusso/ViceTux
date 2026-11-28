@@ -37,6 +37,11 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
+/// In a [`SLOT_STRIDES`] dword: a constant buffer view (this bit without
+/// [`VIEW_INTEGER`], which no buffer view has, and no stride). A program
+/// that picks a constant buffer at a computed index takes the null slot
+/// where the slot has not got this (`Lower::buffer_slot_guard`).
+pub const VIEW_CONSTANT: u32 = VIEW_SIGNED;
 /// Dwords of the [`SLOT_STRIDES`] buffer's strides: heap indices are
 /// clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;

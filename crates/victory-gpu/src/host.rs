@@ -569,6 +569,20 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
+    #[cfg(feature = "diagnostics")]
+    {
+        // A thread of its own: the submitting thread may be the one stuck
+        // waiting for the card when the fault comes.
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("VICTORY_FAULT_FILE").is_some() {
+            STARTED.call_once(|| {
+                let _ = std::thread::Builder::new().name("victory-fault-file".into()).spawn(|| loop {
+                    fault_report_on_request();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                });
+            });
+        }
+    }
     crate::residency::refresh();
     if crate::residency::pressured() {
         trim_spare_chunks();
@@ -13586,6 +13600,30 @@ fn watched_va() -> String {
     #[cfg(feature = "diagnostics")]
     text.push_str(&crate::book::at_loss(va));
     text
+}
+
+/// Diagnostics: `VICTORY_FAULT_FILE=<path>`: once a second, if that file is
+/// there and names a GPU address (hex), what is known of the address is
+/// logged once, as at a device loss ([`watched_va`]). Under Proton on an
+/// NVIDIA card a GPU fault (the kernel's Xid 31) often hangs the channel
+/// with no device loss the runtime reports, so nothing here was ever told;
+/// a script that reads the kernel's log writes the file.
+#[cfg(feature = "diagnostics")]
+fn fault_report_on_request() {
+    static PATH: OnceLock<Option<String>> = OnceLock::new();
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(path) = PATH.get_or_init(|| std::env::var("VICTORY_FAULT_FILE").ok()) else { return };
+    if DONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else { return };
+    let Some(va) = u64::from_str_radix(text.trim().trim_start_matches("0x").replace('_', "").as_str(), 16).ok() else { return };
+    DONE.store(true, Ordering::Relaxed);
+    let mut report = format!("a GPU fault reported from outside at {va:#x}");
+    report.push_str(&crate::shadow::near(va));
+    report.push_str(&crate::descriptor::host::near_heaps(va));
+    report.push_str(&crate::book::at_loss(va));
+    tracing::error!("{report}");
 }
 
 /// The sync interval of our presents (`VICTORY_PRESENT_INTERVAL`, 0 unless

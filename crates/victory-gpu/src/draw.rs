@@ -1013,6 +1013,43 @@ type TargetKey = (usize, (usize, [u32; 7]));
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// A root view the title set whose memory has no copy ([`root_view`] gave
+/// none): the address of 1 MiB of zeros, made once, to bind in its place, and
+/// a line now and then with how many.
+///
+/// Left unbound, the parameter kept what it held before: after a new root
+/// signature, whatever address the host had there last, which may be a
+/// buffer let go since. The GPU then faults reading it through its constant
+/// cache: the Xid 31 at 0x5_8d249000 (GPCCLIENT_GCC, FAULT_PDE) of runs on
+/// an RTX 4060 under Proton, 2-5 minutes into play, at an address no
+/// resource the layer made ever had.
+fn unset_root_view(address: u64) -> Option<u64> {
+    struct Zeros {
+        _kept: ID3D12Resource,
+        gpu: u64,
+    }
+    // SAFETY: D3D12 resources are free-threaded; never written after made.
+    unsafe impl Send for Zeros {}
+    // SAFETY: as above.
+    unsafe impl Sync for Zeros {}
+    static ZEROS: std::sync::OnceLock<Option<Zeros>> = std::sync::OnceLock::new();
+    static UNSET: AtomicU64 = AtomicU64::new(0);
+    let n = UNSET.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(n, address = format_args!("{address:#x}"), "root views with no copy of their memory, bound to zeros (latest address)");
+    }
+    let zeros = ZEROS.get_or_init(|| {
+        let (buffer, data) = crate::host::host()?.upload_buffer(1 << 20)?;
+        // SAFETY: the buffer's whole mapping.
+        unsafe { std::ptr::write_bytes(data, 0, 1 << 20) };
+        crate::host::name(&buffer, || "zeros for root views without a copy".to_owned());
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Some(Zeros { _kept: buffer, gpu })
+    });
+    zeros.as_ref().map(|z| z.gpu)
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -2009,6 +2046,19 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        // No copy of the memory it names: zeros, not whatever
+                        // address the parameter held before (`unset_root_view`).
+                        if let Some(zeros) = unset_root_view(address) {
+                            // SAFETY: an open list; the buffer lives for the process.
+                            unsafe {
+                                match (compute, srv) {
+                                    (false, false) => l.SetGraphicsRootConstantBufferView(param, zeros),
+                                    (false, true) => l.SetGraphicsRootShaderResourceView(param, zeros),
+                                    (true, false) => l.SetComputeRootConstantBufferView(param, zeros),
+                                    (true, true) => l.SetComputeRootShaderResourceView(param, zeros),
+                                }
+                            }
+                        }
                         continue;
                     };
                     if biased {

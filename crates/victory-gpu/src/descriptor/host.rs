@@ -520,6 +520,7 @@ fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Res
         return None;
     };
     // SAFETY: a slot of our heap, a live texture.
+    book_seen(texture);
     unsafe { host.device.CreateShaderResourceView(texture, Some(&desc), at) };
     Some(texture.clone())
 }
@@ -1417,7 +1418,10 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// Bytes per element and typed integer format bits of a buffer view, decoded
 /// in a single pass over the view descriptor; `(None, 0)` if not a buffer view.
 fn view_stride_and_kind(view: &View) -> (Option<u32>, u32) {
-    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
+    use victory_shader::emit::{VIEW_CONSTANT, VIEW_INTEGER, VIEW_SIGNED};
+    if matches!(view, View::Constant(..)) {
+        return (None, VIEW_CONSTANT);
+    }
     let Some((stride, raw, format)) = view_elements(view) else {
         return (None, 0);
     };
@@ -3345,6 +3349,7 @@ impl HostHeap {
                 },
             },
         };
+        book_seen(buffer);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device
@@ -3387,6 +3392,7 @@ impl HostHeap {
                 },
             },
         };
+        book_seen(buffer);
         // SAFETY: a slot of our heap and a live buffer covering the range.
         unsafe {
             host.device.CreateUnorderedAccessView(
@@ -3458,6 +3464,7 @@ impl HostHeap {
             BufferLocation: gpu,
             SizeInBytes: constant_bytes(size),
         };
+        book_seen(buffer);
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -3486,7 +3493,7 @@ impl HostHeap {
             unsafe { host.device.CreateShaderResourceView(buffer, Some(&raw), twin) };
         }
         self.twin_made(index, twin.is_some());
-        self.write_view_metadata(index, 0, 0);
+        self.write_view_metadata(index, victory_shader::emit::VIEW_CONSTANT, 0);
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
@@ -3532,6 +3539,7 @@ impl HostHeap {
         // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
         // zero location makes a null constant buffer view).
         unsafe {
+            book_seen(buffer);
             host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
             self.put(index);
             host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
@@ -3539,7 +3547,7 @@ impl HostHeap {
         self.twin_made(index, true);
         // A constant buffer, as every other writer of a slot says: a slot
         // reused from a structured or typed view must not keep its word.
-        self.write_view_metadata(index, 0, 0);
+        self.write_view_metadata(index, victory_shader::emit::VIEW_CONSTANT, 0);
         self.keep(index, Some(buffer.clone()));
         true
     }
@@ -4356,7 +4364,7 @@ fn buffer_srv(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            .CreateShaderResourceView({ book_seen(&shadow.buffer); &shadow.buffer }, Some(&desc), at)
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
@@ -4479,7 +4487,7 @@ fn buffer_uav(
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
-            .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
+            .CreateUnorderedAccessView({ book_seen(&shadow.buffer); &shadow.buffer }, None::<&ID3D12Resource>, Some(&desc), at)
     };
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
@@ -4741,6 +4749,7 @@ fn make_twinned(
                 BufferLocation: gpu,
                 SizeInBytes: constant_bytes(size),
             };
+            book_seen(&shadow.buffer);
             // SAFETY: slots of our heap; the range lies in the host copy.
             unsafe {
                 device.CreateConstantBufferView(Some(&desc), at);
@@ -4820,6 +4829,7 @@ fn make_twinned(
                 {
                     show_prefilled(desc, prefilled);
                 }
+                book_seen(texture);
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4881,6 +4891,7 @@ fn make_twinned(
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            book_seen(texture);
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -7094,4 +7105,22 @@ mod bake_flip_tests {
         drop(cb2);
         assert!(take_pending_list_flip(id2).is_none(), "dropping uncalled closure cleans up entry");
     }
+}
+
+/// Diagnostics (`VICTORY_BOOK_VIEWS=1`): every resource a host view is made
+/// of goes into the book (`crate::book`), whatever made it, so that a GPU
+/// fault's address can be told from the resources shaders could reach
+/// (the Xid 31 at 0x5_8d249000: the book, fed by five creation sites, had
+/// nothing there).
+#[inline]
+fn book_seen(resource: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("VICTORY_BOOK_VIEWS").is_some_and(|v| v == "1")) {
+            crate::book::made(resource, || "seen by a host view".into());
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = resource;
 }
