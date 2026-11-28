@@ -3450,15 +3450,38 @@ impl State {
         role: crate::ambient::Role,
         indirect: Option<crate::ambient::IndirectHold<'_>>,
     ) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, REFLECTIONS, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, MISS_DEPTH, MISS_LIGHT, MissNote, RADIANCE, REFLECTIONS, Role, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
+        // Which surfaces the miss program's rays are of (its first root
+        // constant): water's reflections are left as they are (the depth
+        // here is of what lies under it), and the alpha layer's unless asked.
+        let layer = match role {
+            Role::Miss => t
+                .used
+                .iter()
+                .find(|u| u.root == RootType::Constants)
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Constants(c)) => c.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(u32::MAX),
+            _ => 0,
+        };
+        if role == Role::Miss
+            && !(layer == crate::ambient::MISS_OPAQUE
+                || layer == crate::ambient::MISS_ALPHA && crate::ambient::specular_alpha())
+        {
+            crate::ambient::note_miss(MissNote::Water);
+            return false;
+        }
         let entry = |kind: ResourceType, at: (u8, u32)| self.table_view(t, true, kind, at);
         let image = match role {
             Role::Resolve => entry(ResourceType::Uav, LIGHT),
             Role::Radiance => entry(ResourceType::Uav, RADIANCE),
             Role::Air => entry(ResourceType::Uav, AIR),
+            Role::Miss => entry(ResourceType::Uav, MISS_LIGHT),
             // The first of the places that holds a 2D image of the format.
             Role::Reflect => REFLECTIONS.iter().find_map(|&at| {
                 entry(ResourceType::Uav, at).filter(|(d, _)| {
@@ -3468,9 +3491,44 @@ impl State {
         };
         let Some((of, image)) = image else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         };
-        let depth = if role == Role::Resolve {
+        let mut depth_size = [of.Width as u32, of.Height];
+        let depth = if role == Role::Miss {
+            // The miss program's image is of half the picture's size, its
+            // depth (32-bit) of the whole.
+            use windows::Win32::Graphics::Dxgi::Common::{
+                DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT,
+                DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+            };
+            let Some((seen, depth)) = entry(ResourceType::Srv, MISS_DEPTH) else {
+                once!(?role, "no stand-in for the indirect light: missing depth SRV");
+                crate::ambient::note_miss(MissNote::NotReady);
+                return false;
+            };
+            let fits = matches!(
+                seen.Format,
+                DXGI_FORMAT_R32_TYPELESS
+                    | DXGI_FORMAT_R32_FLOAT
+                    | DXGI_FORMAT_D32_FLOAT
+                    | DXGI_FORMAT_R32G8X24_TYPELESS
+                    | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+            ) && seen.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                && seen.SampleDesc.Count == 1
+                && seen.Width >= of.Width
+                && seen.Height >= of.Height
+                && seen.Width <= of.Width * 4;
+            if !fits {
+                once!(?role, format = seen.Format.0, "no stand-in for the indirect light: another depth");
+                crate::ambient::note_miss(MissNote::NotReady);
+                return false;
+            }
+            depth_size = [seen.Width as u32, seen.Height];
+            Some(depth)
+        } else if role == Role::Resolve {
             let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
                 once!(?role, "no stand-in for the indirect light: missing depth SRV");
                 return false;
@@ -3489,11 +3547,14 @@ impl State {
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
         let format = match role {
             Role::Resolve | Role::Reflect => 42,
-            Role::Radiance | Role::Air => 26,
+            Role::Radiance | Role::Air | Role::Miss => 26,
         };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
+            if role == Role::Miss {
+                crate::ambient::note_miss(MissNote::NotReady);
+            }
             return false;
         }
         let views = Views {
@@ -3501,8 +3562,13 @@ impl State {
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
+            depth_size,
         };
-        crate::ambient::after(list, role, &views, indirect)
+        let ran = crate::ambient::after(list, role, &views, indirect);
+        if ran && role == Role::Miss {
+            crate::ambient::note_miss(MissNote::Ran(layer));
+        }
+        ran
     }
 
     /// The view a shader of the bound pipeline reads through a table, at
@@ -4889,7 +4955,12 @@ impl State {
             // roles keep to direct dispatches. A single uncounted record
             // can be checked inside the hold, using the clamped dimensions.
             use crate::ambient::{Dispatched, IndirectHold, Role, note_reflect};
-            if p.stages.first().and_then(|s| s.shader.ambient) == Some(Role::Reflect) {
+            let role = p.stages.first().and_then(|s| s.shader.ambient);
+            if role == Some(Role::Miss) {
+                // The stand-in for reflections reads the image's own size, not
+                // the dispatch's: after any indirect call of the miss program.
+                self.after_dispatch(list, p, None);
+            } else if role == Some(Role::Reflect) {
                 if counter.is_some() {
                     if crate::ambient::on() && crate::ambient::holds() {
                         note_reflect(Dispatched::Counted);
