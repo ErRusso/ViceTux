@@ -8621,7 +8621,7 @@ impl<'a> Lower<'a> {
         if null == 0 {
             return Ok(index);
         }
-        let Some(word) = self.slot_word(src, true)? else {
+        let Some(word) = self.slot_word_from(src, true, true)? else {
             return Ok(index);
         };
         let c = self.cur;
@@ -8867,6 +8867,14 @@ impl<'a> Lower<'a> {
     /// format kind ([`super::shader::SLOT_STRIDES`] for `ResourceHeap`,
     /// [`super::shader::SLOT_TABLE_STRIDES`] for `Table` when `allow_table`).
     fn slot_word(&mut self, src: &Source, allow_table: bool) -> Result<Option<V>, Why> {
+        self.slot_word_from(src, allow_table, false)
+    }
+
+    /// [`Self::slot_word`]; `look_only`: the word alone is wanted, not the
+    /// buffers behind the heap's slots, so the table is bound without the
+    /// host bringing every buffer of the heap up to date first
+    /// ([`super::shader::SLOT_TABLE_STRIDES`] whatever the root).
+    fn slot_word_from(&mut self, src: &Source, allow_table: bool, look_only: bool) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };
@@ -8876,10 +8884,13 @@ impl<'a> Lower<'a> {
             .and_then(|a| self.x.native.layout.get(a.param))
             .map(|p| p.root)
         {
-            Some(RootType::ResourceHeap) => super::shader::SLOT_STRIDES,
+            Some(RootType::ResourceHeap) if !look_only => super::shader::SLOT_STRIDES,
+            Some(RootType::ResourceHeap) => super::shader::SLOT_TABLE_STRIDES,
             Some(RootType::Table) if allow_table => super::shader::SLOT_TABLE_STRIDES,
             _ => return Ok(None),
         };
+        // (A look alone is not kept: a stride asked later in the block must
+        // bind the table that brings the heap's buffers up to date.)
         let key = (self.cur, *load, *first);
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
@@ -8908,7 +8919,9 @@ impl<'a> Lower<'a> {
         );
         let f = self.s.m.extract(c, r, 0);
         let v = self.as_int(f);
-        self.strides.insert(key, v);
+        if !look_only {
+            self.strides.insert(key, v);
+        }
         Ok(Some(v))
     }
 

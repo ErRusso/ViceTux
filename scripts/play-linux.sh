@@ -98,14 +98,14 @@ export VICTORY_CONFIG="$(winpath "$home/victory.toml")"
 # Shared with play.ps1.
 export VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1
 export VICTORY_JOIN_COPIES=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1
-# Card steps at stage 1, not play.ps1's 2: with the title's buffer copies done
-# on the card behind flights in the air (stage 2) the card faulted reading an
-# address of the title's space through its constant cache (NVIDIA Xid 31 at
-# 0x5_8d249000 and alike), 3-5 minutes into every run from the prison save.
-# Bisected on an RTX 4060 under Proton: relay 1, card steps 0 and card steps
-# 1 each ran 9 minutes clean (stage 1 twice); stage 2 faulted every time,
-# with or without the relay's copy queue. Gameplay: 13.2 fps at stage 1,
-# 16-17 at stage 2, 10.6 with none.
+# Card steps at stage 1, not play.ps1's 2. The fault that kept stage 2 off
+# (NVIDIA Xid 31 at 0x5_8d249000 through the constant cache, 2-5 minutes in;
+# now and then at stage 1 too) was programs picking a constant buffer or a
+# buffer from the view heap at a computed index and landing on a texture's
+# slot: an NVIDIA card reads the texture's header as an address. The
+# translator now takes the null slot there (VICTORY_SLOT_GUARD); since then
+# stage 2 ran three 8-minute runs clean (it faulted in 6 of 8 before), at
+# about the speed of stage 1 (12.9 against 12.5 fps): CARD_STEPS=2 to use it.
 export VICTORY_CARD_STEPS="${CARD_STEPS:-1}"
 export VICTORY_TITLE_PRIORITIES=0 VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
 # Left out, as trustno1-coder/VIctory-NVIDIA's launcher does (its
